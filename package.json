@@ -1,0 +1,51 @@
+{
+    "name": "@tolokoban/impress",
+    "version": "0.1.0",
+    "description": "Convert teaching markdown files into LibreOffice Impress presentations (.odp)",
+    "type": "module",
+    "bin": {
+        "impress": "dist/impress.js"
+    },
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "prebuild": "rm -rf dist",
+        "build": "tsc",
+        "check": "tsc --noEmit",
+        "prepack": "npm run build",
+        "pub": "npm publish --access public"
+    },
+    "engines": {
+        "node": ">=20.15"
+    },
+    "keywords": [
+        "markdown",
+        "libreoffice",
+        "impress",
+        "odp",
+        "presentation",
+        "slides",
+        "graphviz"
+    ],
+    "author": "Tolokoban",
+    "license": "GPL-3.0",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/tolokoban/impress.git"
+    },
+    "homepage": "https://github.com/tolokoban/impress#readme",
+    "bugs": {
+        "url": "https://github.com/tolokoban/impress/issues"
+    },
+    "publishConfig": {
+        "access": "public"
+    },
+    "dependencies": {
+        "@hpcc-js/wasm-graphviz": "1.30.0"
+    },
+    "devDependencies": {
+        "@types/node": "^24.19.2",
+        "typescript": "^7.0.2"
+    }
+}
