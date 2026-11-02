@@ -930,7 +930,7 @@ class Builder {
             case "para":
                 return this.frame("Texte", x, y, w, h, `<text:p>${runsXml(b.text)}</text:p>`)
             case "list":
-                return this.frame("Greta-outline1", x, y, w, h, this.listXml(b.items), "outline")
+                return this.frame("Master-outline1", x, y, w, h, this.listXml(b.items), "outline")
             case "quote":
                 return this.frame("Citation", x, y, w, h, `<text:p>${runsXml(b.text)}</text:p>`)
             case "prompt":
@@ -1018,7 +1018,7 @@ class Builder {
     titleShapes(title: string, crumbs: string[]): string[] {
         const out: string[] = []
         if (crumbs.length) out.push(this.frame("Fil-ariane", X0, 0.35, W, 0.6, `<text:p>${xmlText(crumbs.join(" › "))}</text:p>`))
-        out.push(this.frame("Greta-title", X0, 0.95, W, 1.6, `<text:p>${xmlText(title)}</text:p>`, "title", this.takeHints()))
+        out.push(this.frame("Master-title", X0, 0.95, W, 1.6, `<text:p>${xmlText(title)}</text:p>`, "title", this.takeHints()))
         return out
     }
 
@@ -1034,7 +1034,7 @@ class Builder {
     contentPages(title: string, crumbs: string[], blocks: Block[]) {
         for (const [content, notes] of this.paginate(blocks)) {
             const [, shapes] = this.layout(content)
-            this.page("Greta", [...this.titleShapes(title, crumbs), ...shapes], notes)
+            this.page("Master", [...this.titleShapes(title, crumbs), ...shapes], notes)
         }
     }
 
@@ -1079,7 +1079,7 @@ class Builder {
                 }
             }
             const notes = k === 0 ? sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : [])) : []
-            this.page("Greta", [...this.titleShapes(sec.title, crumbs), ...shapes], notes)
+            this.page("Master", [...this.titleShapes(sec.title, crumbs), ...shapes], notes)
         }
     }
 
@@ -1237,7 +1237,7 @@ class Builder {
             shapes.push(...this.cellXml(sec, x, y + headH, w, h - headH, textStyle, textPt))
             notes.push(...sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : [])))
         })
-        this.page("Greta", shapes, notes)
+        this.page("Master", shapes, notes)
     }
 
     walk(sec: Section) {
@@ -1355,12 +1355,12 @@ function stylesXml(): string {
     const placeholder = (styleName: string, cls: string, x: number, y: number, w: number, h: number) =>
         `<draw:frame presentation:style-name="${styleName}" presentation:class="${cls}" presentation:placeholder="true" ${Builder.geom(x, y, w, h)}><draw:text-box/></draw:frame>`
     const masters = [
-        `<style:master-page style:name="Greta" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
+        `<style:master-page style:name="Master" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
             `<draw:rect draw:style-name="Decor" ${Builder.geom(0, 0, 0.4, SLIDE_H)}/>` +
             `<draw:line draw:style-name="Decor-ligne" svg:x1="${X0}cm" svg:y1="2.7cm" svg:x2="${X0 + W}cm" svg:y2="2.7cm"/>` +
-            placeholder("Greta-title", "title", X0, 0.95, W, 1.6) +
-            placeholder("Greta-outline1", "outline", X0, Y0, W, H) +
-            `${notes("Greta")}</style:master-page>`,
+            placeholder("Master-title", "title", X0, 0.95, W, 1.6) +
+            placeholder("Master-outline1", "outline", X0, Y0, W, H) +
+            `${notes("Master")}</style:master-page>`,
         `<style:master-page style:name="Section" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
             `<draw:rect draw:style-name="Section-fond" ${Builder.geom(0, 0, SLIDE_W, SLIDE_H)}/>` +
             `<draw:rect draw:style-name="Decor" ${Builder.geom(0, 8.55, SLIDE_W, 0.12)}/>` +

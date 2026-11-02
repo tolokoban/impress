@@ -189,13 +189,13 @@ Since styles inherit from each other, changing a parent changes all its children
 
 #### Where each style is used
 
-**Content slides** (master page `Greta`):
+**Content slides** (master page `Master`):
 
 | Style | Element |
 | --- | --- |
-| `Greta-title` | Slide title. |
+| `Master-title` | Slide title. |
 | `Fil-ariane` | Breadcrumb (parent headings) above the title. |
-| `Greta-outline1` … `Greta-outline9` | Lists, one style per level (each level inherits from the previous one). |
+| `Master-outline1` … `Master-outline9` | Lists, one style per level (each level inherits from the previous one). |
 | `Texte` | Paragraphs. |
 | `Citation` | Blockquotes. |
 | `Prompt` | ` ```prompt ` code blocks (chat bubbles). |
@@ -204,7 +204,7 @@ Since styles inherit from each other, changing a parent changes all its children
 | `Tableau-cadre` | Frame around tables. |
 | `Decor` | Vertical bar on the left of the slide. |
 | `Decor-ligne` | Line under the title. |
-| `Greta-notes` | Speaker notes. |
+| `Master-notes` | Speaker notes. |
 
 **Section slides** (master page `Section`, for `#` headings):
 
@@ -216,7 +216,7 @@ Since styles inherit from each other, changing a parent changes all its children
 | `Decor` | Horizontal bar under the title. |
 | `Section-notes` | Speaker notes. |
 
-`Section-outline1…9`, `Greta-subtitle`, `*-background` and `*-backgroundobjects` exist for LibreOffice's master pages but are not used by the generated content.
+`Section-outline1…9`, `Master-subtitle`, `*-background` and `*-backgroundobjects` exist for LibreOffice's master pages but are not used by the generated content.
 
 **Tables:**
 
@@ -289,7 +289,7 @@ Two properties are on purpose on most text styles and are best kept: `style:shri
 
 #### Bullets
 
-Styles that hold lists (`Greta-outline1`, `Colonne-texte`, `Grille-texte`) have a `bullets` entry:
+Styles that hold lists (`Master-outline1`, `Colonne-texte`, `Grille-texte`) have a `bullets` entry:
 
 ```json
 "bullets": {
@@ -305,7 +305,7 @@ Styles that hold lists (`Greta-outline1`, `Colonne-texte`, `Grille-texte`) have 
 - `indent`: indentation added at each level, in cm (a number, not a string).
 - `size`: size of the bullet relative to the text.
 
-Nested list items use the level of `chars` matching their depth: `Greta-outline2…9` do not need a `bullets` entry of their own.
+Nested list items use the level of `chars` matching their depth: `Master-outline2…9` do not need a `bullets` entry of their own.
 
 ### Table templates
 
@@ -364,7 +364,7 @@ Centered slide titles without the line:
 ```json
 {
     "styles": {
-        "Greta-title": { "paragraph": { "fo:text-align": "center" } },
+        "Master-title": { "paragraph": { "fo:text-align": "center" } },
         "Decor-ligne": { "graphic": { "draw:stroke": "none" } }
     }
 }

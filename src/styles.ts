@@ -135,7 +135,7 @@ const bullets: BulletDef = {
     size: "80%",
 }
 
-function masterStyles(master: "Greta" | "Section"): Record<string, StyleDef> {
+function masterStyles(master: "Master" | "Section"): Record<string, StyleDef> {
     const isSection = master === "Section"
     const styles: Record<string, StyleDef> = {
         [`${master}-title`]: {
@@ -433,7 +433,7 @@ const defaultStyles: Record<string, StyleDef> = {
         parent: "standard",
         graphic: { "draw:stroke": "solid", "svg:stroke-color": "{colors.primary}", "svg:stroke-width": "0.04cm" },
     },
-    ...masterStyles("Greta"),
+    ...masterStyles("Master"),
     ...masterStyles("Section"),
     ...tableStyles("Tableau", "{sizes.table}pt"),
     ...tableStyles("Tableau-petit", "{sizes.tableSmall}pt"),
