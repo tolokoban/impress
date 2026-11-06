@@ -23,6 +23,24 @@ export interface StyleDef {
     text?: Props
     /** Bullets for list levels 1 to 9 (only for styles holding lists). */
     bullets?: BulletDef
+    /** Numbers for list levels 1 to 9 of numbered lists (only for styles holding lists). */
+    numbers?: NumberDef
+}
+
+export interface NumberDef {
+    /** Numbering per level: "1" (1, 2, 3), "a", "A", "i" or "I". */
+    formats: string[]
+    /** Text after the number, e.g. "." or ")". */
+    suffix: string
+    color: string
+    /** Size of the number relative to the text. */
+    size: string
+    /** "bold" or "normal". */
+    weight: string
+    /** Indentation added for each level, in cm. */
+    indent: number
+    /** Room for the number, in cm (bullets use 0.8cm). */
+    width: number
 }
 
 export interface BulletDef {
@@ -32,6 +50,19 @@ export interface BulletDef {
     indent: number
     /** Size of the bullet relative to the text. */
     size: string
+}
+
+/** Image drawn on a master page, above its background color and below its decorations. */
+export interface BackgroundImage {
+    /** Path relative to the markdown file; "" for no image. */
+    image: string
+    /** "stretch" fills the area, "contain" keeps the aspect ratio and centers the image in it. */
+    fit: "stretch" | "contain"
+    /** Area in cm; defaults to the whole slide. */
+    x?: number
+    y?: number
+    width?: number
+    height?: number
 }
 
 export interface TableTemplate {
@@ -93,13 +124,25 @@ export const defaultTheme = {
     },
     /** Geometry in cm (16:9 slide). */
     slide: { width: 28, height: 15.75 },
-    content: { x: 1.2, y: 3.0, width: 25.6, height: 11.9, gap: 0.3 },
+    content: { x: 1.2, y: 3.0, width: 25.6, height: 11.9, gap: 0.3, align: "top" as "top" | "center" },
     /** `@graph` diagrams. */
     graph: {
-        /** Connector kind for edges: "curve", "line", "standard" (elbows) or "lines". */
-        connector: "curve",
         /** Maximum enlargement of a diagram relative to its Graphviz size. */
         maxScale: 1.5,
+        /** Resolution of the PNG rendered by Graphviz, in dots per inch. */
+        dpi: 300,
+    },
+    /** Every embedded image (graphs included) is stored as WebP. */
+    images: {
+        /** WebP quality, from 0 to 100. */
+        quality: 70,
+        /** Longest side in pixels: larger images are shrunk. */
+        maxSize: 3840,
+    },
+    /** Images of the master pages, styled by `Master-image` and `Section-image`. */
+    backgrounds: {
+        Master: { image: "", fit: "stretch" } as BackgroundImage,
+        Section: { image: "", fit: "stretch" } as BackgroundImage,
     },
 }
 
@@ -135,6 +178,16 @@ const bullets: BulletDef = {
     size: "80%",
 }
 
+const numbers: NumberDef = {
+    formats: ["1", "a", "i", "1", "a", "i", "1", "a", "i"],
+    suffix: ".",
+    color: "{colors.accent}",
+    size: "100%",
+    weight: "bold",
+    indent: 0.9,
+    width: 0.9,
+}
+
 function masterStyles(master: "Master" | "Section"): Record<string, StyleDef> {
     const isSection = master === "Section"
     const styles: Record<string, StyleDef> = {
@@ -161,6 +214,7 @@ function masterStyles(master: "Master" | "Section"): Record<string, StyleDef> {
             paragraph: { "fo:margin-top": "0.1cm", "fo:margin-bottom": "0.15cm", "fo:line-height": "105%" },
             text: { ...sans, "fo:font-size": "{sizes.list.0}pt", "fo:color": "{colors.ink}" },
             bullets,
+            numbers,
         },
     }
     for (let level = 2; level <= 9; level++) {
@@ -176,6 +230,18 @@ function masterStyles(master: "Master" | "Section"): Record<string, StyleDef> {
         graphic: { "draw:stroke": "none", "draw:fill": "none" },
         paragraph: { "fo:margin-bottom": "0.2cm" },
         text: { ...sans, "fo:font-size": "{sizes.notes}pt", "fo:color": "{colors.ink}" },
+    }
+    styles[`${master}-image`] = {
+        family: "graphic",
+        parent: "standard",
+        graphic: {
+            "draw:stroke": "none",
+            "draw:fill": "none",
+            "draw:image-opacity": "100%",
+            "draw:color-mode": "standard",
+            "draw:luminance": "0%",
+            "draw:contrast": "0%",
+        },
     }
     styles[`${master}-background`] = { family: "presentation", graphic: { "draw:stroke": "none", "draw:fill": "none" } }
     styles[`${master}-backgroundobjects`] = { family: "presentation", graphic: { "draw:shadow": "hidden" } }
@@ -266,6 +332,12 @@ const defaultStyles: Record<string, StyleDef> = {
             "draw:stroke": "solid",
             "svg:stroke-color": "{colors.primary}",
             "svg:stroke-width": "0.03cm",
+            "draw:shadow": "visible",
+            "draw:shadow-offset-x": "0.1cm",
+            "draw:shadow-offset-y": "0.1cm",
+            "draw:shadow-color": "{colors.muted}",
+            "draw:shadow-opacity": "30%",
+            "loext:shadow-blur": "0.3cm",
             "fo:padding-left": "0.6cm",
             "fo:padding-right": "0.6cm",
             "fo:padding-top": "0.4cm",
@@ -324,6 +396,7 @@ const defaultStyles: Record<string, StyleDef> = {
         paragraph: { "fo:margin-bottom": "0.15cm" },
         text: { "fo:font-size": "{sizes.columnText}pt" },
         bullets,
+        numbers,
     },
     /** `@layout grid ...`: cell headings and cell bodies, colored by position. */
     "Grille-titre": {
@@ -348,6 +421,7 @@ const defaultStyles: Record<string, StyleDef> = {
         paragraph: { "fo:margin-bottom": "0.12cm" },
         text: { "fo:font-size": "{sizes.gridText}pt" },
         bullets,
+        numbers,
     },
     ...gridStyles(),
     /** Master page decorations. */
@@ -360,73 +434,6 @@ const defaultStyles: Record<string, StyleDef> = {
         family: "graphic",
         parent: "standard",
         graphic: { "draw:fill": "solid", "draw:fill-color": "{colors.accent}", "draw:stroke": "none" },
-    },
-    /** `@graph` diagrams: nodes, clusters and edges. */
-    "Graphe-noeud": {
-        family: "graphic",
-        parent: "standard",
-        graphic: {
-            ...shrink,
-            "draw:fill": "solid",
-            "draw:fill-color": "{colors.graphNode}",
-            "draw:stroke": "solid",
-            "svg:stroke-color": "{colors.primary}",
-            "svg:stroke-width": "0.03cm",
-            "draw:textarea-vertical-align": "middle",
-            "draw:textarea-horizontal-align": "center",
-            "fo:padding-left": "0.05cm",
-            "fo:padding-right": "0.05cm",
-            "fo:padding-top": "0.05cm",
-            "fo:padding-bottom": "0.05cm",
-        },
-        paragraph: { "fo:text-align": "center" },
-        text: { "fo:font-size": "{sizes.graphText}pt", "fo:color": "{colors.ink}" },
-    },
-    /** Nodes with `shape=plaintext` (or none). */
-    "Graphe-texte": {
-        family: "graphic",
-        parent: "Graphe-noeud",
-        graphic: { "draw:fill": "none", "draw:stroke": "none" },
-    },
-    /** Graph label (`graph [label=...]`). */
-    "Graphe-titre": {
-        family: "graphic",
-        parent: "Graphe-texte",
-        text: { "fo:font-weight": "bold", "fo:color": "{colors.primary}" },
-    },
-    "Graphe-groupe": {
-        family: "graphic",
-        parent: "standard",
-        graphic: {
-            "draw:fill": "solid",
-            "draw:fill-color": "{colors.graphCluster}",
-            "draw:stroke": "solid",
-            "svg:stroke-color": "{colors.muted}",
-            "svg:stroke-width": "0.02cm",
-            "draw:textarea-vertical-align": "top",
-            "draw:textarea-horizontal-align": "center",
-            "draw:auto-grow-height": "false",
-        },
-        paragraph: { "fo:text-align": "center" },
-        text: { "fo:font-size": "{sizes.graphEdgeText}pt", "fo:font-weight": "bold", "fo:color": "{colors.muted}" },
-    },
-    /** Edges without arrow (undirected graphs, `dir=none`). */
-    "Graphe-lien-simple": {
-        family: "graphic",
-        parent: "standard",
-        graphic: { "draw:stroke": "solid", "svg:stroke-color": "{colors.ink}", "svg:stroke-width": "0.03cm" },
-        text: { "fo:font-size": "{sizes.graphEdgeText}pt", "fo:color": "{colors.ink}" },
-    },
-    "Graphe-lien": {
-        family: "graphic",
-        parent: "Graphe-lien-simple",
-        graphic: { "draw:marker-end": "Fleche", "draw:marker-end-width": "0.3cm" },
-    },
-    /** Edges with `dir=both`. */
-    "Graphe-lien-double": {
-        family: "graphic",
-        parent: "Graphe-lien",
-        graphic: { "draw:marker-start": "Fleche", "draw:marker-start-width": "0.3cm" },
     },
     "Decor-ligne": {
         family: "graphic",

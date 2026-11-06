@@ -18,17 +18,40 @@
  *   @layout columns 1fr 2fr auto
  *                           the next 3 sections on one slide, in columns sized by
  *                           fractions of the free width or by their content (auto)
- *   @graph diagram.dot      Graphviz diagram converted into native, editable shapes
+ *                           Not followed by a heading, a layout takes the next blocks
+ *                           (paragraph, list, image...) of the section instead, one per cell
+ *   @graph diagram.dot      Graphviz diagram, rendered as a PNG image by the "dot" tool
+ *
+ * Every embedded image (graphs included) is stored as WebP (see `theme.images`).
+ *   @next                   start a new slide with the same title as the current one
+ *   @compact                the next table is shrunk to fit on one slide instead of being split
+ *   @reveal C1,3 R1-4       the rows of the next table appear one slide after the other; the
+ *                           columns (C) and rows (R) listed, both optional, are always visible
  *   ```prompt ... ```       chat prompt bubble
  */
 import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs"
-import { basename, dirname, extname, resolve } from "node:path"
+import { basename, dirname, extname, join, resolve } from "node:path"
 import { crc32, deflateRawSync } from "node:zlib"
-import type { Graphviz } from "@hpcc-js/wasm-graphviz"
+import { spawnSync } from "node:child_process"
+import { createInterface } from "node:readline/promises"
 
-import { defaultStyle, type BulletDef, type Props, type StyleConfig, type StyleDef } from "./styles.ts"
+import sharp from "sharp"
+
+import { defaultStyle, type BackgroundImage, type BulletDef, type NumberDef, type Props, type StyleConfig, type StyleDef } from "./styles.ts"
 
 const PT = 0.03528 // cm per point
+
+// ---------------------------------------------------------------- terminal colors
+
+/** ANSI styles, only when writing to a terminal and NO_COLOR is not set. */
+const COLOR = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR
+const ansi = (on: string, off: string) => (text: string) => (COLOR ? `\x1b[${on}m${text}\x1b[${off}m` : text)
+/** File names. Ends with "normal intensity" only, so it can be nested in a colored text. */
+const bold = ansi("1", "22")
+/** Example of prompt for an AI agent. */
+const cyan = ansi("36", "39")
+/** Questions waiting for an answer. */
+const yellow = ansi("93", "39")
 
 // Style of the file being converted (see `useStyle()`).
 let style: StyleConfig = defaultStyle
@@ -40,6 +63,7 @@ let Y0 = 0
 let W = 0
 let H = 0
 let GAP = 0
+let CENTER = false
 
 function useStyle(config: StyleConfig) {
     style = config
@@ -47,6 +71,7 @@ function useStyle(config: StyleConfig) {
     SLIDE_W = config.theme.slide.width
     SLIDE_H = config.theme.slide.height
     ;({ x: X0, y: Y0, width: W, height: H, gap: GAP } = config.theme.content)
+    CENTER = config.theme.content.align === "center"
 }
 
 // ---------------------------------------------------------------- style files
@@ -97,14 +122,61 @@ function resolveValue(value: string, where: string): string {
 
 // ---------------------------------------------------------------- parsing
 
+/** [level (0 = top), text, number of the item (numbered lists only)]. */
+type ListItem = [number, string, number?]
+
 type Block =
     | { t: "para"; text: string }
-    | { t: "list"; items: [number, string][] }
+    | { t: "list"; items: ListItem[] }
     | { t: "quote"; text: string }
     | { t: "prompt" | "code"; lines: string[] }
-    | { t: "table"; header: string[] | null; rows: string[][] }
+    | TableBlock
     | { t: "image"; alt: string; src: string }
     | { t: "note"; text: string }
+    | { t: "layout"; layout: Layout; cells: Section[] }
+
+type TableBlock = {
+    t: "table"
+    header: string[] | null
+    rows: string[][]
+    /** Number of side-by-side tables the rows are spread over (1 by default), each with the header. */
+    columns?: number
+    /** All the rows of a table split over several slides: the column widths are computed from them. */
+    ref?: string[][]
+    /** Set by `@compact`: shrink the text instead of splitting the table. */
+    compact?: boolean
+    /** Font size in points, when it is not `sizes.table`. */
+    pt?: number
+    /** Set by `@reveal`: the rows appear one slide after the other. */
+    reveal?: Reveal
+    /** Rows revealed on the current slide (all of them when undefined). */
+    shown?: Set<string[]>
+}
+
+/** `@reveal C1,3 R1-4`: what stays visible while the rows of a table are revealed. */
+type Reveal = {
+    /** Always visible columns (0-based). */
+    cols: Set<number>
+    /** Always visible rows (the row arrays of the table). */
+    rows: Set<string[]>
+}
+
+/** Is this cell hidden until its row is revealed? */
+function isHidden(b: TableBlock, row: string[], col: number): boolean {
+    return !!b.reveal && !!b.shown && !b.shown.has(row) && !b.reveal.rows.has(row) && !b.reveal.cols.has(col)
+}
+
+/** `1,3`, `1-4`, `2,5-7`: 1-based numbers, returned 0-based. */
+function parseNumbers(spec: string, where: string): number[] {
+    const out: number[] = []
+    for (const part of spec.split(",")) {
+        const m = part.match(/^(\d+)(?:-(\d+))?$/)
+        const [a, b] = m ? [Number(m[1]), Number(m[2] ?? m[1])] : [0, 0]
+        if (!m || a < 1 || b < a) throw new Error(`${where}: invalid list "${spec}" (expected numbers or ranges, e.g. 1,3 or 1-4)`)
+        for (let n = a; n <= b; n++) out.push(n - 1)
+    }
+    return out
+}
 
 /** `@layout grid 3x2` or `@layout columns 1fr 2fr auto`. */
 type Layout =
@@ -146,6 +218,8 @@ class Section {
     children: Section[] = []
     /** Set on the first section of a group laid out on a single slide. */
     layout: Layout | null = null
+    /** Created by `@next`: continues the previous section on a new slide. */
+    continued = false
 
     /** Folder of the markdown file, for relative image paths. */
     source: string
@@ -173,7 +247,8 @@ function stripMd(s: string): string {
         .trim()
 }
 
-const LIST_RE = /^(\s*)[*-]\s+(.*)$/
+/** `- item`, `* item`, `1. item` or `1) item`: [indent, number (ordered only), text]. */
+const LIST_RE = /^(\s*)(?:[*-]|(\d+)[.)])\s+(.*)$/
 const IMG_RE = /^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$/
 const HEAD_RE = /^(#{1,6})\s+(.*)$/
 
@@ -182,8 +257,35 @@ function parse(md: string, file: string): Section {
     let cur = root
     const lines = md.split("\n")
     let para: string[] = []
-    let list: { t: "list"; items: [number, string][] } | null = null
+    let list: { t: "list"; items: ListItem[] } | null = null
     let layout: Layout | null = null
+    // `@layout` followed by content instead of a heading: the next blocks fill its cells.
+    let grouped: { t: "layout"; layout: Layout; cells: Section[] } | null = null
+    // Line number of an `@compact` waiting for its table (0 if none).
+    let compact = 0
+    const dropCompact = () => {
+        if (compact) console.warn(`  ! ${bold(file)}:${compact}: "@compact" is not followed by a table`)
+        compact = 0
+    }
+    // `@reveal` waiting for its table: line number, always visible columns and rows (0-based).
+    let reveal: { line: number; cols: number[]; rows: number[] } | null = null
+    const dropReveal = () => {
+        if (reveal) console.warn(`  ! ${bold(file)}:${reveal.line}: "@reveal" is not followed by a table`)
+        reveal = null
+    }
+
+    const push = (b: Block) => {
+        if (!grouped) return void cur.blocks.push(b)
+        const cells = grouped.cells
+        if (b.t === "note") return void (cells.length ? cells[cells.length - 1].blocks : cur.blocks).push(b)
+        if (cells.length === cellCount(grouped.layout)) {
+            grouped = null
+            return void cur.blocks.push(b)
+        }
+        const cell = new Section(cur.level + 1, "", cur, root.source)
+        cell.blocks.push(b)
+        cells.push(cell)
+    }
 
     const flushPara = () => {
         if (!para.length) return
@@ -192,11 +294,11 @@ function parse(md: string, file: string): Section {
             text += l.trim()
             if (j < para.length - 1) text += l.endsWith("  ") ? "\n" : " "
         })
-        cur.blocks.push({ t: "para", text })
+        push({ t: "para", text })
         para = []
     }
     const flushList = () => {
-        if (list) cur.blocks.push(list)
+        if (list) push(list)
         list = null
     }
     const flush = () => {
@@ -210,6 +312,8 @@ function parse(md: string, file: string): Section {
         let m: RegExpMatchArray | null
         if ((m = line.match(HEAD_RE))) {
             flush()
+            dropCompact()
+            grouped = null
             const level = m[1].length
             while (cur.level >= level) cur = cur.parent!
             const sec = new Section(level, stripMd(m[2]), cur, root.source)
@@ -219,14 +323,48 @@ function parse(md: string, file: string): Section {
             cur = sec
         } else if (s.startsWith("@layout")) {
             flush()
-            layout = parseLayout(s.slice(7).trim(), `${file}:${i + 1}`)
+            grouped = null
+            const spec = parseLayout(s.slice(7).trim(), `${file}:${i + 1}`)
+            let j = i + 1
+            while (j < lines.length && lines[j].trim() === "") j++
+            if (j < lines.length && HEAD_RE.test(lines[j])) layout = spec
+            else {
+                grouped = { t: "layout", layout: spec, cells: [] }
+                cur.blocks.push(grouped)
+            }
+        } else if (s === "@next") {
+            flush()
+            grouped = null
+            // A heading right after `@next` starts the new slide by itself.
+            let j = i + 1
+            while (j < lines.length && lines[j].trim() === "") j++
+            if (j < lines.length && HEAD_RE.test(lines[j])) continue
+            if (!cur.parent) throw new Error(`${file}:${i + 1}: "@next" needs a previous heading`)
+            const sec = new Section(cur.level, cur.title, cur.parent, root.source)
+            sec.continued = true
+            cur.parent.children.push(sec)
+            cur = sec
+        } else if (s === "@compact") {
+            flush()
+            dropCompact()
+            compact = i + 1
+        } else if (s === "@reveal" || s.startsWith("@reveal ")) {
+            flush()
+            dropReveal()
+            const where = `${file}:${i + 1}`
+            reveal = { line: i + 1, cols: [], rows: [] }
+            for (const arg of s.slice(7).trim().split(/\s+/).filter(Boolean)) {
+                const m = arg.match(/^([CR])(.+)$/i)
+                if (!m) throw new Error(`${where}: expected "@reveal [C<columns>] [R<rows>]" (e.g. "@reveal C1,3 R1-4"), got "${s}"`)
+                reveal[m[1].toUpperCase() === "C" ? "cols" : "rows"].push(...parseNumbers(m[2], where))
+            }
         } else if (s.startsWith("@graph")) {
             flush()
             const src = s.slice(6).trim()
             const where = `${file}:${i + 1}`
             if (!src.toLowerCase().endsWith(".dot")) throw new Error(`${where}: expected "@graph <relative path of a .dot file>", got "${s}"`)
             if (!existsSync(resolve(dirname(file), src))) throw new Error(`${where}: file not found: ${src}`)
-            cur.blocks.push({ t: "image", alt: "", src })
+            push({ t: "image", alt: "", src })
         } else if (s.startsWith("@hint")) {
             flush()
             cur.hints.push(s)
@@ -234,16 +372,16 @@ function parse(md: string, file: string): Section {
             flush()
             const buf: string[] = []
             for (i++; i < lines.length && lines[i].trim() !== "@note end"; i++) buf.push(lines[i])
-            cur.blocks.push({ t: "note", text: buf.join("\n").trim() })
+            push({ t: "note", text: buf.join("\n").trim() })
         } else if (s.startsWith("@note")) {
             flush()
-            cur.blocks.push({ t: "note", text: s.slice(5).trim() })
+            push({ t: "note", text: s.slice(5).trim() })
         } else if (s.startsWith("```")) {
             flush()
             const lang = s.slice(3).trim()
             const buf: string[] = []
             for (i++; i < lines.length && !lines[i].trim().startsWith("```"); i++) buf.push(lines[i])
-            cur.blocks.push({ t: lang === "prompt" ? "prompt" : "code", lines: buf })
+            push({ t: lang === "prompt" ? "prompt" : "code", lines: buf })
         } else if (s.startsWith("|")) {
             flush()
             const rows: string[][] = []
@@ -255,20 +393,30 @@ function parse(md: string, file: string): Section {
             let header: string[] | null = rows[0]
             const body = rows.slice(1).filter(r => !/^[\s:\-|]*$/.test(r.join("")))
             if (header.every(c => c === "" || c === ".")) header = null
-            cur.blocks.push({ t: "table", header, rows: body })
+            const table: TableBlock = { t: "table", header, rows: body }
+            if (compact) table.compact = true
+            compact = 0
+            if (reveal) {
+                const { cols, rows: fixed } = reveal as { cols: number[]; rows: number[] }
+                table.reveal = { cols: new Set(cols), rows: new Set(fixed.flatMap(n => (body[n] ? [body[n]] : []))) }
+                reveal = null
+            }
+            push(table)
         } else if (s.startsWith(">")) {
             flush()
             const buf: string[] = []
             for (; i < lines.length && lines[i].trim().startsWith(">"); i++) buf.push(lines[i].trim().slice(1).trim())
             i--
-            cur.blocks.push({ t: "quote", text: buf.join(" ") })
+            push({ t: "quote", text: buf.join(" ") })
         } else if ((m = line.match(IMG_RE))) {
             flush()
-            cur.blocks.push({ t: "image", alt: m[1], src: m[2] })
+            push({ t: "image", alt: m[1], src: m[2] })
         } else if ((m = line.match(LIST_RE))) {
             flushPara()
             list ??= { t: "list", items: [] }
-            list.items.push([Math.floor(m[1].length / 2), m[2].trim()])
+            const item: ListItem = [Math.floor(m[1].length / 2), m[3].trim()]
+            if (m[2] !== undefined) item.push(Number(m[2]))
+            list.items.push(item)
         } else if (s === "") {
             flushPara()
             // A blank line ends a list unless the next non-blank line is a list item.
@@ -276,7 +424,7 @@ function parse(md: string, file: string): Section {
             while (j < lines.length && lines[j].trim() === "") j++
             if (list && !(j < lines.length && LIST_RE.test(lines[j]))) flushList()
         } else if (list && line.startsWith(" ")) {
-            const items: [number, string][] = list.items
+            const items: ListItem[] = list.items
             items[items.length - 1][1] += " " + s
         } else {
             flushList()
@@ -284,7 +432,9 @@ function parse(md: string, file: string): Section {
         }
     }
     flush()
-    if (layout) console.warn(`  ! ${file}: "${(layout as Layout).source}" is not followed by any section`)
+    dropCompact()
+    dropReveal()
+    if (layout) console.warn(`  ! ${bold(file)}: "${(layout as Layout).source}" is not followed by any section`)
     return root
 }
 
@@ -381,7 +531,7 @@ function paraH(text: string, width: number, pt = sizes.text): number {
     return text.split("\n").reduce((h, p) => h + textH(plainLen(p), width, pt), 0) + 0.25
 }
 
-function listH(items: [number, string][], width: number): number {
+function listH(items: ListItem[], width: number): number {
     let h = 0
     for (const [lvl, txt] of items) h += textH(plainLen(txt), width - 0.9 * (lvl + 1), sizes.list[Math.min(lvl, 8)]) + 0.3
     return h + 0.1
@@ -395,22 +545,186 @@ function promptSize(lines: string[], width: number): [number, number] {
     return [w, h]
 }
 
+// ---------------------------------------------------------------- images in table cells
+
+/** Folder of the markdown file being converted, for the relative paths of cell images. */
+let mdDir = "."
+
+/** Image of a table cell, sized in em (1em = the font size of the table, 16px in HTML terms). */
+type CellImage = { src: string; alt: string; w: number; h: number }
+type Cell = { text: string; imgs: CellImage[] }
+
+/** `<img src="..." width="48" height="48">` or `![alt](src)`. */
+const CELL_IMG_RE = /<img\s[^>]*>|!\[([^\]]*)\]\(([^)\s]+)\)/gi
+/** Pixels per em: the HTML sizes of the markdown assume a 16px font. */
+const PX_PER_EM = 16
+/** Height (in em) of a cell image without any size. */
+const DEFAULT_IMG_EM = 2
+/** Horizontal gap (in em) between the images of a cell, and between them and the text. */
+const IMG_GAP_EM = 0.3
+/** Horizontal padding of the table cells (both sides), in cm. */
+const CELL_PAD_X = 0.4
+
+const cellCache = new Map<string, Cell>()
+
+function htmlAttr(tag: string, name: string): string | undefined {
+    const m = tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"))
+    return m ? (m[1] ?? m[2] ?? m[3]) : undefined
+}
+
+/** Split a table cell into its text and its images (HTML `<img>` or markdown `![]()`). */
+function cell(s: string): Cell {
+    let c = cellCache.get(s)
+    if (c) return c
+    const imgs: CellImage[] = []
+    const text = s
+        .replace(CELL_IMG_RE, (tag: string, mdAlt?: string, mdSrc?: string) => {
+            const src = mdSrc ?? htmlAttr(tag, "src")
+            if (!src) return tag
+            const px = (name: string) => {
+                const v = mdSrc ? undefined : htmlAttr(tag, name)
+                const n = v === undefined ? NaN : parseFloat(v)
+                return n > 0 ? n / PX_PER_EM : undefined
+            }
+            let w = px("width")
+            let h = px("height")
+            if (w === undefined || h === undefined) {
+                const [iw, ih] = imageSize(resolve(mdDir, src))
+                if (w !== undefined) h = (w * ih) / iw
+                else if (h !== undefined) w = (h * iw) / ih
+                else [w, h] = [(DEFAULT_IMG_EM * iw) / ih, DEFAULT_IMG_EM]
+            }
+            imgs.push({ src, alt: mdAlt ?? htmlAttr(tag, "alt") ?? "", w: w!, h: h! })
+            return " "
+        })
+        .replace(/\s+/g, " ")
+        .trim()
+    c = { text, imgs }
+    cellCache.set(s, c)
+    return c
+}
+
+/**
+ * Size (in cm) of the images of a cell at `pt` points, side by side: [scale, width, height].
+ * They are shrunk to fit in the column if needed (`scale` < 1).
+ */
+function cellImgBox(c: Cell, colW: number, pt: number): [number, number, number] {
+    if (!c.imgs.length) return [1, 0, 0]
+    const em = pt * PT
+    const w = (c.imgs.reduce((a, i) => a + i.w, 0) + IMG_GAP_EM * (c.imgs.length - 1)) * em
+    const h = Math.max(...c.imgs.map(i => i.h)) * em
+    const room = Math.max(colW - CELL_PAD_X - (c.text ? 2 * em : 0), 0.1)
+    const scale = Math.min(1, room / w)
+    return [scale, w * scale, h * scale]
+}
+
+/** Width (in cm) taken by the images of a cell before its text, gap included. */
+function cellTextIndent(c: Cell, colW: number, pt: number): number {
+    const [, w] = cellImgBox(c, colW, pt)
+    return w && c.text ? w + IMG_GAP_EM * pt * PT : 0
+}
+
+/**
+ * Advance widths (in 1/1000 em) of the printable ASCII characters, from space to "~", in
+ * Liberation Sans Bold (the metrics of Arial Bold): the font of the table headers.
+ */
+const BOLD_WIDTHS = [
+    278, 333, 474, 556, 556, 889, 722, 238, 333, 333, 389, 584, 278, 333, 278, 278, 556, 556, 556, 556, 556, 556, 556, 556,
+    556, 556, 333, 333, 584, 584, 584, 611, 975, 722, 722, 722, 722, 667, 611, 778, 722, 278, 556, 722, 611, 833, 722, 778,
+    667, 778, 722, 667, 611, 722, 667, 944, 667, 667, 611, 333, 278, 333, 584, 556, 333, 556, 611, 556, 611, 556, 333, 611,
+    611, 278, 278, 556, 278, 889, 611, 611, 611, 611, 389, 556, 333, 611, 556, 778, 556, 556, 500, 389, 280, 389, 584,
+]
+
+/** Width (in cm) of a word in bold at `pt` points, a bit overestimated to be safe. */
+function boldWordW(word: string, pt: number): number {
+    let units = 0
+    for (const ch of word) {
+        // Accented letters are as wide as their base letter.
+        const code = ch.normalize("NFD").charCodeAt(0)
+        units += code >= 32 && code <= 126 ? BOLD_WIDTHS[code - 32] : 650
+    }
+    return (units / 1000) * pt * PT * 1.05
+}
+
+/**
+ * Do the words of the header of a `@compact` or `@reveal` table fit in their columns, at the
+ * size of the table, on a slide of full width? Several words may wrap, but no word is cut.
+ */
+function headerFits(b: TableBlock): boolean {
+    if (!b.header) return true
+    const pt = b.pt ?? sizes.table
+    const cols = tableBlockCols(b, W)
+    return b.header.every((s, i) => {
+        const c = cell(s)
+        const room = cols[i] - CELL_PAD_X - cellTextIndent(c, cols[i], pt)
+        const words = inline(c.text)
+            .map(r => r.text)
+            .join("")
+            .split(/\s+/)
+            .filter(Boolean)
+        return words.every(w => boldWordW(w, pt) <= room)
+    })
+}
+
 function tableCols(header: string[] | null, rows: string[][], width: number): number[] {
     const all = header ? [header, ...rows] : rows
     const ncol = Math.max(...all.map(r => r.length))
     const lens = new Array<number>(ncol).fill(0)
-    for (const r of all) r.forEach((cell, c) => (lens[c] = Math.max(lens[c], Math.min(plainLen(cell), 45) + 4)))
+    for (const r of all)
+        r.forEach((s, c) => {
+            const { text, imgs } = cell(s)
+            // An em is about two characters (see `textH()`).
+            const imgLen = imgs.length ? 2 * (imgs.reduce((a, i) => a + i.w, 0) + IMG_GAP_EM * imgs.length) : 0
+            lens[c] = Math.max(lens[c], Math.min(plainLen(text), 45) + imgLen + 4)
+        })
     const tot = lens.reduce((a, b) => a + b, 0)
     return lens.map(l => (width * l) / tot)
 }
 
 function rowH(r: string[], cols: number[], pt: number): number {
-    return Math.max(...r.map((c, i) => textH(plainLen(c), cols[i] - 0.4, pt))) + 0.35
+    // Below the size of small tables (`@compact`), the room around the text shrinks too, down to the cell padding.
+    const pad = pt >= sizes.tableSmall ? 0.35 : 0.2 + (0.15 * pt) / sizes.tableSmall
+    return (
+        Math.max(
+            ...r.map((s, i) => {
+                const c = cell(s)
+                const th = c.text ? textH(plainLen(c.text), cols[i] - CELL_PAD_X - cellTextIndent(c, cols[i], pt), pt) : 0
+                return Math.max(th, cellImgBox(c, cols[i], pt)[2])
+            }),
+        ) + pad
+    )
 }
 
 function tableH(header: string[] | null, rows: string[][], width: number, pt: number, cols?: number[]): number {
     cols ??= tableCols(header, rows, width)
     return (header ? [header, ...rows] : rows).reduce((h, r) => h + rowH(r, cols, pt), 0)
+}
+
+/** Horizontal gap between the side-by-side parts of a table. */
+const TABLE_GAP = 0.6
+
+/** Rows of each side-by-side part of a table block. */
+function tableParts(b: TableBlock): string[][][] {
+    const n = b.columns ?? 1
+    if (n <= 1) return [b.rows]
+    const per = Math.ceil(b.rows.length / n)
+    return Array.from({ length: n }, (_, i) => b.rows.slice(i * per, (i + 1) * per)).filter(p => p.length)
+}
+
+function tablePartW(b: TableBlock, width: number): number {
+    const n = b.columns ?? 1
+    return (width - TABLE_GAP * (n - 1)) / n
+}
+
+/** Column widths of each part, the same for all the parts of a table. */
+function tableBlockCols(b: TableBlock, width: number): number[] {
+    return tableCols(b.header, b.ref ?? b.rows, tablePartW(b, width))
+}
+
+function tableBlockH(b: TableBlock, width: number): number {
+    const cols = tableBlockCols(b, width)
+    const pw = tablePartW(b, width)
+    return Math.max(...tableParts(b).map(rows => tableH(b.header, rows, pw, b.pt ?? sizes.table, cols)))
 }
 
 function blockH(b: Block, width: number): number {
@@ -425,7 +739,7 @@ function blockH(b: Block, width: number): number {
         case "code":
             return promptSize(b.lines, width)[1]
         case "table":
-            return tableH(b.header, b.rows, width, sizes.table)
+            return tableBlockH(b, width)
         default:
             return 0
     }
@@ -433,7 +747,7 @@ function blockH(b: Block, width: number): number {
 
 function imageSize(path: string): [number, number] {
     const ext = extname(path).toLowerCase()
-    if (ext === ".dot") return graphLayout(path).size
+    if (ext === ".dot") return graphPng(path).size
     const data = readFileSync(path)
     if (ext === ".svg") {
         const head = data.subarray(0, 4000).toString("utf8")
@@ -471,177 +785,227 @@ function fit(iw: number, ih: number, bw: number, bh: number): [number, number] {
 
 // ---------------------------------------------------------------- graphviz
 
-const CM_PER_POINT = 2.54 / 72
-
-interface GvObject {
-    _gvid: number
-    name: string
-    [attr: string]: unknown
-}
-
-interface GvEdge {
-    tail: number
-    head: number
-    [attr: string]: unknown
-}
-
-interface GraphLayout {
-    name: string
-    directed: boolean
-    /** Bounding box in points: x0, y0, x1, y1 (y axis pointing up). */
-    bb: number[]
+interface GraphPng {
+    /** PNG rendered by Graphviz. */
+    png: Buffer
     /** Natural size in cm. */
     size: [number, number]
-    objects: GvObject[]
-    edges: GvEdge[]
-    /** Graph attributes (label, lp, lwidth, fontsize, fontcolor...). */
-    attrs: Record<string, unknown>
 }
 
-const graphCache = new Map<string, GraphLayout>()
+/** Rendered diagrams, keyed by the arguments of `dot` (which include the theme). */
+const graphCache = new Map<string, GraphPng>()
 
-/** Graphviz compiled to WebAssembly (`@hpcc-js/wasm-graphviz`), loaded by `loadGraphviz()`. */
-let graphviz: Graphviz | null = null
-let graphvizError = ""
+const IS_WINDOWS = process.platform === "win32"
 
-async function loadGraphviz() {
-    try {
-        const lib = await import("@hpcc-js/wasm-graphviz")
-        graphviz = await lib.Graphviz.load()
-    } catch (err) {
-        graphvizError = err instanceof Error ? err.message : String(err)
-    }
+/** Path of the Graphviz `dot` executable: `undefined` until searched, `null` if not found. */
+let dotPath: string | null | undefined
+
+function hasCommand(cmd: string): boolean {
+    const r = IS_WINDOWS
+        ? spawnSync("where", [cmd], { stdio: "ignore" })
+        : spawnSync("sh", ["-c", `command -v ${cmd}`], { stdio: "ignore" })
+    return r.status === 0
+}
+
+/** `dot` from the PATH, or from the usual install folders (a fresh install may not be in the PATH yet). */
+function findDot(): string | null {
+    if (hasCommand("dot")) return "dot"
+    const candidates = IS_WINDOWS
+        ? [process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "Programs")]
+              .filter((d): d is string => !!d)
+              .map(d => join(d, "Graphviz", "bin", "dot.exe"))
+        : ["/opt/homebrew/bin/dot", "/usr/local/bin/dot", "/opt/local/bin/dot", "/usr/bin/dot"]
+    return candidates.find(p => existsSync(p)) ?? null
+}
+
+/** The command installing Graphviz on this system, if a known package manager is available. */
+function installCommand(): string[] | null {
+    const sudo = !IS_WINDOWS && process.getuid?.() !== 0 && hasCommand("sudo") ? ["sudo"] : []
+    const managers: [string, string[]][] =
+        process.platform === "darwin"
+            ? [
+                  ["brew", ["brew", "install", "graphviz"]],
+                  ["port", [...sudo, "port", "install", "graphviz"]],
+              ]
+            : IS_WINDOWS
+              ? [
+                    ["winget", ["winget", "install", "--id", "Graphviz.Graphviz", "-e", "--accept-package-agreements", "--accept-source-agreements"]],
+                    ["choco", ["choco", "install", "graphviz", "-y"]],
+                    ["scoop", ["scoop", "install", "graphviz"]],
+                ]
+              : [
+                    ["apt-get", [...sudo, "apt-get", "install", "-y", "graphviz"]],
+                    ["dnf", [...sudo, "dnf", "install", "-y", "graphviz"]],
+                    ["yum", [...sudo, "yum", "install", "-y", "graphviz"]],
+                    ["pacman", [...sudo, "pacman", "-S", "--noconfirm", "graphviz"]],
+                    ["zypper", [...sudo, "zypper", "install", "-y", "graphviz"]],
+                    ["apk", [...sudo, "apk", "add", "graphviz"]],
+                    ["brew", ["brew", "install", "graphviz"]],
+                ]
+    return managers.find(([cmd]) => hasCommand(cmd))?.[1] ?? null
 }
 
 /**
- * Lay out a .dot file with Graphviz, using the fonts of the current style.
- * The fonts are inserted as default attributes after the opening brace, so
- * attributes set in the .dot file still take precedence.
+ * Make sure the Graphviz `dot` tool is available, offering to install it if it is not.
+ * Searched once per run; `graphPng()` fails with an explanation if it is still missing.
  */
-function graphLayout(path: string): GraphLayout {
-    if (!graphviz) throw new Error(`Graphviz is not available (run "pnpm install" in scripts/impress): ${graphvizError}`)
+async function ensureDot() {
+    if (dotPath !== undefined) return
+    dotPath = findDot()
+    if (dotPath) return
+    console.log("  ! @graph needs the Graphviz \"dot\" tool, which is not installed on this machine.")
+    const cmd = installCommand()
+    if (!cmd) {
+        console.log("    Install Graphviz (https://graphviz.org/download/), then run again.")
+        return
+    }
+    const shown = cmd.join(" ")
+    if (!process.stdin.isTTY) {
+        console.log(`    Install it with:  ${shown}`)
+        return
+    }
+    const rl = createInterface({ input: process.stdin, output: process.stdout })
+    const answer = (await rl.question(yellow(`    Install it now with "${shown}"? [Y/n] `))).trim().toLowerCase()
+    rl.close()
+    if (answer && !["y", "yes", "o", "oui"].includes(answer)) return
+    const r = spawnSync(cmd[0], cmd.slice(1), { stdio: "inherit", shell: IS_WINDOWS })
+    if (r.status !== 0) console.log(`    Installation failed${r.error ? `: ${r.error.message}` : ""}.`)
+    dotPath = findDot()
+    if (dotPath) console.log(`    Graphviz installed (${dotPath}).`)
+    else if (r.status === 0) console.log("    Graphviz is installed, but \"dot\" is not found yet: open a new terminal and run again.")
+}
+
+/** Does this markdown use `@graph` (outside code blocks)? */
+function usesGraph(src: string): boolean {
+    let fenced = false
+    for (const line of readFileSync(src, "utf8").split(/\r?\n/)) {
+        const s = line.trim()
+        if (s.startsWith("```")) fenced = !fenced
+        else if (!fenced && s.startsWith("@graph")) return true
+    }
+    return false
+}
+
+/** An argument as typed in a shell, quoted when needed. */
+function shellArg(arg: string): string {
+    return /^[\w@%+=:,./#-]+$/.test(arg) ? arg : `"${arg.replace(/(["\\$`])/g, "\\$1")}"`
+}
+
+/**
+ * Index just after the `{` opening the body of the root graph of a DOT source
+ * (skipping comments and quoted strings), or -1 if there is none.
+ */
+function dotBodyStart(dot: string): number {
+    let i = 0
+    let lineStart = true
+    while (i < dot.length) {
+        const c = dot[i]
+        if (lineStart && c === "#") {
+            // Preprocessor-like line, ignored by Graphviz.
+            const end = dot.indexOf("\n", i)
+            i = end < 0 ? dot.length : end
+            continue
+        }
+        if (c === "\n") lineStart = true
+        else if (!/\s/.test(c)) lineStart = false
+        if (c === "/" && dot[i + 1] === "/") {
+            const end = dot.indexOf("\n", i)
+            i = end < 0 ? dot.length : end
+            continue
+        }
+        if (c === "/" && dot[i + 1] === "*") {
+            const end = dot.indexOf("*/", i + 2)
+            i = end < 0 ? dot.length : end + 2
+            continue
+        }
+        if (c === '"') {
+            i++
+            while (i < dot.length && dot[i] !== '"') i += dot[i] === "\\" ? 2 : 1
+            i++
+            continue
+        }
+        if (c === "<") {
+            // HTML-like ID: balanced angle brackets.
+            let depth = 0
+            do {
+                if (dot[i] === "<") depth++
+                else if (dot[i] === ">") depth--
+                i++
+            } while (i < dot.length && depth > 0)
+            continue
+        }
+        if (c === "{") return i + 1
+        i++
+    }
+    return -1
+}
+
+/** A DOT attribute list: `[a="x", b="y"]`. */
+function dotAttrs(attrs: Record<string, string | number>): string {
+    return `[${Object.entries(attrs)
+        .map(([k, v]) => `${k}="${String(v).replace(/(["\\])/g, "\\$1")}"`)
+        .join(", ")}]`
+}
+
+/**
+ * Render a .dot file as PNG with Graphviz (its own Cairo renderer, as in DOT viewers:
+ * LibreOffice's SVG import changes the look of Graphviz SVGs), using the fonts and colors of the
+ * current style. They are inserted as `graph`/`node`/`edge` default statements at the very
+ * beginning of the root graph body, so every attribute set in the .dot file (including its own
+ * `node [...]` / `edge [...]` defaults) still takes precedence. They are NOT given on the command
+ * line: Graphviz's `-N`/`-E` options override the defaults declared in the file.
+ * The resolution is `theme.graph.dpi`.
+ */
+function graphPng(path: string): GraphPng {
+    if (!dotPath) throw new Error(`${path}: the Graphviz "dot" tool is required by @graph (https://graphviz.org/download/)`)
     const font = style.theme.fonts.sans.replace(/'/g, "")
-    const defaults =
-        `graph [fontname="${font}", fontsize=${sizes.graphEdgeText}]; ` +
-        `node [fontname="${font}", fontsize=${sizes.graphText}]; ` +
-        `edge [fontname="${font}", fontsize=${sizes.graphEdgeText}]; `
+    const { colors } = style.theme
+    const dpi = style.theme.graph.dpi
     const source = readFileSync(path, "utf8")
-    const head = source.match(/\b(?:strict\s+)?(?:di)?graph\b[^{]*\{/i)
-    if (!head || head.index === undefined) throw new Error(`${path}: no "graph { ... }" or "digraph { ... }" found`)
-    const at = head.index + head[0].length
-    const dot = source.slice(0, at) + defaults + source.slice(at)
-    let layout = graphCache.get(dot)
-    if (layout) return layout
-    let json: string
-    try {
-        json = graphviz.layout(dot, "json", "dot")
-    } catch (err) {
-        throw new Error(`Graphviz failed on ${path}: ${err instanceof Error ? err.message : err}`)
+    const at = dotBodyStart(source)
+    if (at < 0) throw new Error(`${path}: no graph body found (expected "graph { ... }" or "digraph { ... }")`)
+    const defaults = [
+        `graph ${dotAttrs({
+            bgcolor: "transparent",
+            fontname: font,
+            fontsize: sizes.graphEdgeText,
+            fontcolor: colors.primary,
+            style: "filled",
+            fillcolor: colors.graphCluster,
+            pencolor: colors.muted,
+        })};`,
+        `node ${dotAttrs({
+            fontname: font,
+            fontsize: sizes.graphText,
+            fontcolor: colors.ink,
+            style: "filled",
+            fillcolor: colors.graphNode,
+            color: colors.primary,
+        })};`,
+        `edge ${dotAttrs({
+            fontname: font,
+            fontsize: sizes.graphEdgeText,
+            fontcolor: colors.ink,
+            color: colors.ink,
+        })};`,
+    ].join(" ")
+    const input = `${source.slice(0, at)} ${defaults}\n${source.slice(at)}`
+    // The dpi stays on the command line: it is not a matter of style, the file must not change it.
+    const args = ["-Tpng", `-Gdpi=${dpi}`]
+    const key = [...args, input].join("\0")
+    let graph = graphCache.get(key)
+    if (graph) return graph
+    console.log(`  ${bold(cyan("> "))}${bold([dotPath, ...args].map(shellArg).join(" "))} < ${shellArg(path)} ${cyan("(with the theme defaults)")}`)
+    const r = spawnSync(dotPath, args, { input, maxBuffer: 256 * 1024 * 1024 })
+    if (r.error || r.status !== 0) {
+        throw new Error(`Graphviz failed on ${path}: ${r.error?.message ?? r.stderr.toString("utf8").trim()}`)
     }
-    const g = JSON.parse(json)
-    const bb = String(g.bb ?? "0,0,0,0").split(",").map(Number)
-    layout = {
-        name: g.name ?? "",
-        directed: g.directed !== false,
-        bb,
-        size: [Math.max(bb[2] - bb[0], 1) * CM_PER_POINT, Math.max(bb[3] - bb[1], 1) * CM_PER_POINT],
-        objects: g.objects ?? [],
-        edges: g.edges ?? [],
-        attrs: g,
-    }
-    graphCache.set(dot, layout)
-    return layout
-}
-
-/** Graphviz node shapes and their Impress preset geometry. */
-const NODE_SHAPES: Record<string, string> = {
-    box: "rectangle",
-    rect: "rectangle",
-    rectangle: "rectangle",
-    square: "rectangle",
-    record: "rectangle",
-    Mrecord: "round-rectangle",
-    ellipse: "ellipse",
-    oval: "ellipse",
-    circle: "ellipse",
-    doublecircle: "ellipse",
-    point: "ellipse",
-    diamond: "diamond",
-    Mdiamond: "diamond",
-    parallelogram: "parallelogram",
-    trapezium: "trapezoid",
-    hexagon: "hexagon",
-    octagon: "octagon",
-    triangle: "isosceles-triangle",
-    cylinder: "flowchart-magnetic-disk",
-    note: "flowchart-document",
-    folder: "flowchart-card",
-    star: "star5",
-}
-
-const COLOR_NAMES: Record<string, string> = {
-    black: "#000000",
-    white: "#FFFFFF",
-    red: "#FF0000",
-    green: "#00A000",
-    blue: "#0000FF",
-    yellow: "#FFFF00",
-    orange: "#FFA500",
-    purple: "#800080",
-    pink: "#FFC0CB",
-    brown: "#A52A2A",
-    gray: "#808080",
-    grey: "#808080",
-    lightgray: "#D3D3D3",
-    lightgrey: "#D3D3D3",
-    darkgray: "#A9A9A9",
-    lightblue: "#ADD8E6",
-    lightyellow: "#FFFFE0",
-    lightgreen: "#90EE90",
-    lightpink: "#FFB6C1",
-    gold: "#FFD700",
-    navy: "#000080",
-    cyan: "#00FFFF",
-    magenta: "#FF00FF",
-    darkgreen: "#006400",
-    darkblue: "#00008B",
-    darkred: "#8B0000",
-}
-
-function gvColor(value: unknown): string | null {
-    if (typeof value !== "string" || !value) return null
-    const v = value.split(":")[0].trim()
-    if (/^#[0-9a-f]{6}$/i.test(v)) return v.toUpperCase()
-    if (/^#[0-9a-f]{8}$/i.test(v)) return v.slice(0, 7).toUpperCase()
-    return COLOR_NAMES[v.toLowerCase()] ?? null
-}
-
-/** Text of a Graphviz label, with "\n" for line breaks. */
-function gvLabel(raw: unknown, name: string, graphName: string, record = false): string {
-    let label = typeof raw === "string" ? raw : "\\N"
-    if (label.startsWith("<") && label.endsWith(">")) {
-        label = label
-            .slice(1, -1)
-            .replace(/<br\s*\/?>/gi, "\n")
-            .replace(/<[^>]+>/g, "")
-    }
-    label = label.replaceAll("\\N", name).replaceAll("\\G", graphName)
-    if (record) label = label.replace(/[{}]/g, "").replace(/\s*\|\s*/g, "\n")
-    return label
-        .replace(/\\[nlr]/g, "\n")
-        .replace(/\n$/, "")
-        .replace(/\\(.)/g, "$1")
-}
-
-/** Stroke properties for Graphviz `style=dashed` or `style=dotted`. */
-function dashed(gvStyle: unknown): Props {
-    const dash = Object.keys(style.dashes)[0]
-    return dash && /\b(dashed|dotted)\b/.test(String(gvStyle ?? "")) ? { "draw:stroke": "dash", "draw:stroke-dash": dash } : {}
-}
-
-function gvPoint(s: string): [number, number] {
-    const [x, y] = s.split(",").map(Number)
-    return [x, y]
+    const png = r.stdout
+    if (png.length < 24 || png.readUInt32BE(0) !== 0x89504e47) throw new Error(`Graphviz did not produce a PNG for ${path}`)
+    const cmPerPixel = 2.54 / dpi
+    graph = { png, size: [png.readUInt32BE(16) * cmPerPixel, png.readUInt32BE(20) * cmPerPixel] }
+    graphCache.set(key, graph)
+    return graph
 }
 
 // ---------------------------------------------------------------- layout
@@ -656,13 +1020,61 @@ const MIME: Record<string, string> = {
 
 interface Picture {
     href: string
+    /** Original data (PNG for graphs), encoded as WebP by `encodePictures()`. */
     data: Buffer
+    /** Natural size: in cm for graphs, in pixels (or SVG units) otherwise. Only the ratio matters for images. */
     size: [number, number]
+}
+
+/**
+ * Encode the pictures as WebP (`theme.images.quality`), shrunk so that their longest side
+ * is at most `theme.images.maxSize` pixels. SVG images are rasterized at that size too.
+ * A WebP already small enough is kept as is, to avoid losing quality twice.
+ */
+async function encodePictures(pics: Picture[]) {
+    const { quality, maxSize } = style.theme.images
+    await Promise.all(
+        pics.map(async pic => {
+            const input = pic.data
+            const isSvg = /^\s*(<\?xml|<svg|<!--|<!DOCTYPE)/i.test(input.subarray(0, 256).toString("utf8"))
+            let density: number | undefined
+            if (isSvg) {
+                // Rasterize at maxSize pixels for the longest side (72 dpi = 1 SVG unit per pixel).
+                const longest = Math.max(pic.size[0], pic.size[1], 1)
+                density = Math.min(Math.max((72 * maxSize) / longest, 1), 100000)
+            }
+            const img = sharp(input, { density, limitInputPixels: false })
+            const meta = await img.metadata()
+            const big = Math.max(meta.width ?? 0, meta.height ?? 0) > maxSize
+            if (meta.format === "webp" && !big) return
+            pic.data = await img
+                .rotate() // apply the EXIF orientation of photos
+                .resize({ width: maxSize, height: maxSize, fit: "inside", withoutEnlargement: true })
+                .webp({ quality })
+                .toBuffer()
+        }),
+    )
 }
 
 type Page = { master: string; shapes: string[]; notes: string[] }
 
 const f2 = (n: number) => n.toFixed(2)
+
+/**
+ * The content of one slide, once per step of its `@reveal` tables: the first step shows their
+ * header and their always visible cells, each following step reveals one more row (tables in
+ * the order of the slide, rows in reading order). Rows with nothing to reveal are skipped.
+ */
+function revealSteps(content: Block[]): Block[][] {
+    const order = content.flatMap(b =>
+        b.t === "table" && b.reveal ? b.rows.filter(r => !b.reveal!.rows.has(r) && r.some((c, i) => c !== "" && !b.reveal!.cols.has(i))) : [],
+    )
+    if (!content.some(b => b.t === "table" && b.reveal)) return [content]
+    return Array.from({ length: order.length + 1 }, (_, k) => {
+        const shown = new Set(order.slice(0, k))
+        return content.map(b => (b.t === "table" && b.reveal ? { ...b, shown } : b))
+    })
+}
 
 class Builder {
     base: string
@@ -670,16 +1082,14 @@ class Builder {
     pages: Page[] = []
     colStyles = new Map<string, string>()
     rowStyles = new Map<string, string>()
+    paraStyles = new Map<string, string>()
     /** Hints waiting to be attached to the next slide title. */
     pendingHints: string[] = []
-    /** Automatic graphic styles (Graphviz colors), keyed by their properties. */
-    autoStyles = new Map<string, { name: string; parent: string; graphic: Props }>()
-    /** Automatic paragraph styles (text size and color in diagrams). */
-    paraStyles = new Map<string, { name: string; text: Props }>()
-    graphCount = 0
 
     constructor(base: string) {
         this.base = base
+        mdDir = base
+        cellCache.clear()
     }
 
     // -- resources
@@ -687,9 +1097,11 @@ class Builder {
         let pic = this.pictures.get(src)
         if (!pic) {
             const path = resolve(this.base, src)
-            let name = basename(src)
+            const isGraph = extname(src).toLowerCase() === ".dot"
+            let name = `${basename(src, extname(src))}.webp`
             while ([...this.pictures.values()].some(p => p.href === `Pictures/${name}`)) name = `_${name}`
-            pic = { href: `Pictures/${name}`, data: readFileSync(path), size: imageSize(path) }
+            const graph = isGraph ? graphPng(path) : null
+            pic = { href: `Pictures/${name}`, data: graph ? graph.png : readFileSync(path), size: graph ? graph.size : imageSize(path) }
             this.pictures.set(src, pic)
         }
         return pic
@@ -699,6 +1111,16 @@ class Builder {
         const key = f2(w)
         if (!this.colStyles.has(key)) this.colStyles.set(key, `co${this.colStyles.size + 1}`)
         return this.colStyles.get(key)!
+    }
+
+    /**
+     * Automatic paragraph style setting the font size (in points) of a `@compact` table,
+     * and the left margin (in cm) leaving room for the images of a cell.
+     */
+    paraStyle(pt: number, indent = 0): string {
+        const key = indent ? `${f2(pt)}/${f2(indent)}` : f2(pt)
+        if (!this.paraStyles.has(key)) this.paraStyles.set(key, `Pt${this.paraStyles.size + 1}`)
+        return this.paraStyles.get(key)!
     }
 
     rowStyle(h: number): string {
@@ -727,28 +1149,58 @@ class Builder {
         return desc
     }
 
-    listXml(items: [number, string][]): string {
+    /**
+     * Lists of a frame using the style `frameStyle`. Bullet-only lists take their bullets from that
+     * style. Lists with numbered items name the list styles `<frameStyle>-numbers` and
+     * `<frameStyle>-bullets` (see `listStylesXml()`) on every nested list.
+     */
+    listXml(items: ListItem[], frameStyle: string): string {
+        const holder = listStyleHolder(frameStyle)
+        const styled = holder !== null && items.some(it => it[2] !== undefined)
         const out: string[] = []
-        let depth = 0
-        for (const [lvl, txt] of items) {
-            while (depth > lvl + 1) {
-                out.push("</text:list-item></text:list>")
-                depth--
+        // For each open list: is it numbered?
+        const open: boolean[] = []
+        const close = () => {
+            out.push("</text:list-item></text:list>")
+            open.pop()
+        }
+        for (const [lvl, txt, num] of items) {
+            const ordered = num !== undefined
+            while (open.length > lvl + 1) close()
+            if (open.length === lvl + 1) {
+                if (open[lvl] === ordered) out.push("</text:list-item><text:list-item>")
+                else close()
             }
-            if (depth === lvl + 1) out.push("</text:list-item><text:list-item>")
-            while (depth < lvl + 1) {
-                out.push("<text:list><text:list-item>")
-                depth++
+            while (open.length < lvl + 1) {
+                const name = styled ? ` text:style-name="${esc(holder)}-${ordered ? "numbers" : "bullets"}"` : ""
+                const start = ordered && open.length === lvl && num !== 1 ? ` text:start-value="${num}"` : ""
+                out.push(`<text:list${name}><text:list-item${start}>`)
+                open.push(ordered)
             }
             out.push(`<text:p>${runsXml(txt)}</text:p>`)
         }
-        while (depth-- > 0) out.push("</text:list-item></text:list>")
+        while (open.length) close()
         return out.join("")
     }
 
-    tableXml(header: string[] | null, rows: string[][], x: number, y: number, width: number, pt: number, small = false, cols?: number[]): string {
+    tableXml(
+        header: string[] | null,
+        rows: string[][],
+        x: number,
+        y: number,
+        width: number,
+        pt: number,
+        small = false,
+        cols?: number[],
+        hidden: (row: string[], col: number) => boolean = () => false,
+    ): string {
         cols ??= tableCols(header, rows, width)
         const prefix = small ? "Tableau-petit" : "Tableau"
+        // A size other than the one of the cell styles (`@compact`) needs a paragraph style.
+        const defaultPt = pt === (small ? sizes.tableSmall : sizes.table)
+        const para = (indent: number) => (defaultPt && !indent ? "" : ` text:style-name="${this.paraStyle(pt, indent)}"`)
+        // Images of the cells, drawn over the table: a table cell of Impress only holds text.
+        const overlays: string[] = []
         const parts = [
             `<draw:frame draw:style-name="Tableau-cadre" ${Builder.geom(x, y, width, tableH(header, rows, width, pt, cols))}>`,
             `<table:table table:template-name="${prefix}" table:use-first-row-styles="${header ? "true" : "false"}" table:use-banding-rows-styles="true">`,
@@ -758,162 +1210,53 @@ class Builder {
             ...(header ? [["entete", header] as [string, string[]]] : []),
             ...rows.map((r, i): [string, string[]] => [i % 2 === 0 ? "cellule" : "cellule-alt", r]),
         ]
+        let cy = y
         for (const [kind, r] of all) {
-            parts.push(`<table:table-row table:style-name="${this.rowStyle(rowH(r, cols, pt))}">`)
-            cols.forEach((_, i) => {
-                parts.push(`<table:table-cell table:style-name="${prefix}-${kind}"><text:p>${runsXml(r[i] ?? "")}</text:p></table:table-cell>`)
+            const rh = rowH(r, cols, pt)
+            parts.push(`<table:table-row table:style-name="${this.rowStyle(rh)}">`)
+            let cx = x
+            cols.forEach((cw, i) => {
+                // A hidden cell keeps the size of its content, so the table does not move when it shows up.
+                const c = kind !== "entete" && hidden(r, i) ? { text: "", imgs: [] } : cell(r[i] ?? "")
+                const indent = cellTextIndent(c, cw, pt)
+                parts.push(`<table:table-cell table:style-name="${prefix}-${kind}"><text:p${para(indent)}>${runsXml(c.text)}</text:p></table:table-cell>`)
+                if (c.imgs.length) {
+                    const [scale, iw] = cellImgBox(c, cw, pt)
+                    const em = pt * PT * scale
+                    // Alone in its cell, an image is centered; otherwise it comes before the text.
+                    let ix = c.text ? cx + CELL_PAD_X / 2 : cx + (cw - iw) / 2
+                    for (const img of c.imgs) {
+                        const [w, h] = [img.w * em, img.h * em]
+                        overlays.push(this.imageXml(img.src, ix, cy + (rh - h) / 2, w, h, img.alt))
+                        ix += w + IMG_GAP_EM * em
+                    }
+                }
+                cx += cw
             })
             parts.push("</table:table-row>")
+            cy += rh
         }
         parts.push("</table:table></draw:frame>")
-        return parts.join("")
+        return parts.join("") + overlays.join("")
     }
 
-    imageXml(src: string, x: number, y: number, w: number, h: number): string {
-        if (extname(src).toLowerCase() === ".dot") return this.graphXml(resolve(this.base, src), x, y, w, h)
-        const { href } = this.picture(src)
-        const mime = href.endsWith(".svg") ? ' draw:mime-type="image/svg+xml"' : ""
-        return (
-            `<draw:frame draw:style-name="Image" ${Builder.geom(x, y, w, h)}>` +
-            `<draw:image xlink:href="${esc(href)}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"${mime}/>` +
-            `</draw:frame>`
-        )
-    }
-
-    /** Automatic style deriving from a named style, for colors set in a .dot file. */
-    autoStyle(parent: string, graphic: Props): string {
-        if (!Object.keys(graphic).length) return parent
-        const key = JSON.stringify([parent, graphic])
-        let entry = this.autoStyles.get(key)
-        if (!entry) {
-            entry = { name: `gr${this.autoStyles.size + 1}`, parent, graphic }
-            this.autoStyles.set(key, entry)
-        }
-        return entry.name
-    }
-
-    /**
-     * A paragraph with text properties of its own. LibreOffice ignores text
-     * properties in automatic graphic styles, so they go on the paragraph.
-     */
-    para(text: string, props: Props): string {
-        if (!text) return ""
-        const key = JSON.stringify(props)
-        let entry = this.paraStyles.get(key)
-        if (!entry) {
-            entry = { name: `Pg${this.paraStyles.size + 1}`, text: props }
-            this.paraStyles.set(key, entry)
-        }
-        return `<text:p text:style-name="${entry.name}">${xmlText(text)}</text:p>`
-    }
-
-    /** A Graphviz diagram as a group of native shapes linked by connectors. */
-    graphXml(path: string, x: number, y: number, w: number, h: number): string {
-        const g = graphLayout(path)
-        // Do not blow small diagrams up: text keeps its size, shapes would not.
+    imageXml(src: string, x: number, y: number, w: number, h: number, alt = ""): string {
+        const { href, size } = this.picture(src)
+        // Do not blow small diagrams up: their text would become huge.
         const maxScale = style.theme.graph.maxScale
-        if (w > g.size[0] * maxScale) {
-            const [fw, fh] = fit(g.size[0], g.size[1], g.size[0] * maxScale, g.size[1] * maxScale)
+        if (extname(src).toLowerCase() === ".dot" && w > size[0] * maxScale) {
+            const [fw, fh] = fit(size[0], size[1], size[0] * maxScale, size[1] * maxScale)
             x += (w - fw) / 2
             y += (h - fh) / 2
             w = fw
             h = fh
         }
-        const scale = (w / g.size[0]) * CM_PER_POINT
-        // Text follows the diagram scale, starting from the font sizes of the .dot file.
-        const textProps = (fontsize: unknown, fallback: number, color: unknown): Props => {
-            const pt = Math.max(4, Math.round(Number(fontsize ?? fallback) * (scale / CM_PER_POINT) * 2) / 2)
-            const c = gvColor(color)
-            return { "fo:font-size": `${pt}pt`, ...(c ? { "fo:color": c } : {}) }
-        }
-        const [bx0, , , by1] = g.bb
-        const px = (p: number) => x + (p - bx0) * scale
-        const py = (p: number) => y + (by1 - p) * scale
-        const id = (gvid: number) => `g${this.graphCount}n${gvid}`
-        this.graphCount++
-        const out: string[] = [`<draw:g>`]
-
-        const title = gvLabel(g.attrs.label ?? "", g.name, g.name)
-        if (title && typeof g.attrs.lp === "string") {
-            const [lx, ly] = gvPoint(g.attrs.lp)
-            const lw = Number(g.attrs.lwidth ?? 1) * 72 * scale + 0.4
-            const lh = Number(g.attrs.lheight ?? 0.3) * 72 * scale + 0.2
-            const text = this.para(title, textProps(g.attrs.fontsize, sizes.graphEdgeText, g.attrs.fontcolor))
-            out.push(this.frame("Graphe-titre", px(lx) - lw / 2, py(ly) - lh / 2, lw, lh, text))
-        }
-
-        // Clusters first, so they stay behind the nodes.
-        for (const o of g.objects) {
-            if (typeof o.bb !== "string" || !o.name.startsWith("cluster")) continue
-            const [x0, y0, x1, y1] = o.bb.split(",").map(Number)
-            const fill = gvColor(o.fillcolor) ?? (String(o.style ?? "").includes("filled") ? gvColor(o.color) : null)
-            const stroke = gvColor(o.pencolor) ?? gvColor(o.color)
-            const st = this.autoStyle(
-                "Graphe-groupe",
-                { ...(fill ? { "draw:fill-color": fill } : {}), ...(stroke ? { "svg:stroke-color": stroke } : {}), ...dashed(o.style) },
-            )
-            const label = gvLabel(o.label ?? "", o.name, g.name)
-            out.push(
-                `<draw:rect draw:style-name="${st}" ${Builder.geom(px(x0), py(y1), (x1 - x0) * scale, (y1 - y0) * scale)}>` +
-                    this.para(label, textProps(o.fontsize, sizes.graphEdgeText, o.fontcolor)) +
-                    `</draw:rect>`,
-            )
-        }
-
-        for (const o of g.objects) {
-            if (typeof o.pos !== "string") continue
-            const [cx, cy] = gvPoint(o.pos)
-            const nw = Number(o.width ?? 0.75) * 72 * scale
-            const nh = Number(o.height ?? 0.5) * 72 * scale
-            const shape = String(o.shape ?? "ellipse")
-            const styles = String(o.style ?? "")
-            const plain = ["plaintext", "plain", "none", "underline"].includes(shape) || styles.includes("invis")
-            let geometry = NODE_SHAPES[shape] ?? "rectangle"
-            if (geometry === "rectangle" && styles.includes("rounded")) geometry = "round-rectangle"
-            const fill = styles.includes("filled") ? (gvColor(o.fillcolor) ?? gvColor(o.color)) : null
-            const stroke = gvColor(o.color)
-            const st = this.autoStyle(
-                plain ? "Graphe-texte" : "Graphe-noeud",
-                { ...(fill ? { "draw:fill-color": fill } : {}), ...(stroke && !plain ? { "svg:stroke-color": stroke } : {}), ...(plain ? {} : dashed(o.style)) },
-            )
-            const label = shape === "point" ? "" : gvLabel(o.label, o.name, g.name, shape.endsWith("record"))
-            const nid = id(o._gvid)
-            out.push(
-                `<draw:custom-shape draw:style-name="${st}" draw:id="${nid}" xml:id="${nid}" ${Builder.geom(px(cx) - nw / 2, py(cy) - nh / 2, nw, nh)}>` +
-                    this.para(label, textProps(o.fontsize, sizes.graphText, o.fontcolor)) +
-                    `<draw:enhanced-geometry svg:viewBox="0 0 21600 21600" draw:type="${geometry}"/>` +
-                    `</draw:custom-shape>`,
-            )
-        }
-
-        const kind = style.theme.graph.connector
-        for (const e of g.edges) {
-            const tokens = String(e.pos ?? "").split(/\s+/).filter(Boolean)
-            const points = tokens.filter(t => !/^[se],/.test(t)).map(gvPoint)
-            const startTip = tokens.find(t => t.startsWith("s,"))
-            const endTip = tokens.find(t => t.startsWith("e,"))
-            let start = startTip ? gvPoint(startTip.slice(2)) : (points[0] ?? [0, 0])
-            let end = endTip ? gvPoint(endTip.slice(2)) : (points[points.length - 1] ?? [0, 0])
-            let [tail, head] = [e.tail, e.head]
-            const dir = String(e.dir ?? (g.directed ? "forward" : "none"))
-            if (dir === "back") {
-                ;[tail, head] = [head, tail]
-                ;[start, end] = [end, start]
-            }
-            const parent = dir === "none" ? "Graphe-lien-simple" : dir === "both" ? "Graphe-lien-double" : "Graphe-lien"
-            const stroke = gvColor(e.color)
-            const st = this.autoStyle(parent, { ...(stroke ? { "svg:stroke-color": stroke } : {}), ...dashed(e.style) })
-            const label = gvLabel(e.label ?? "", "", g.name)
-            out.push(
-                `<draw:connector draw:style-name="${st}" draw:type="${esc(kind)}" ` +
-                    `svg:x1="${f2(px(start[0]))}cm" svg:y1="${f2(py(start[1]))}cm" svg:x2="${f2(px(end[0]))}cm" svg:y2="${f2(py(end[1]))}cm" ` +
-                    `draw:start-shape="${id(tail)}" draw:end-shape="${id(head)}">` +
-                    this.para(label, textProps(e.fontsize, sizes.graphEdgeText, e.fontcolor)) +
-                    `</draw:connector>`,
-            )
-        }
-        out.push("</draw:g>")
-        return out.join("")
+            return (
+            `<draw:frame draw:style-name="Image" ${Builder.geom(x, y, w, h)}>` +
+            `<draw:image xlink:href="${esc(href)}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>` +
+            (alt ? `<svg:title>${esc(alt)}</svg:title>` : "") +
+            `</draw:frame>`
+        )
     }
 
     promptXml(lines: string[], x: number, y: number, w: number, h: number, style = "Prompt"): string {
@@ -930,7 +1273,7 @@ class Builder {
             case "para":
                 return this.frame("Texte", x, y, w, h, `<text:p>${runsXml(b.text)}</text:p>`)
             case "list":
-                return this.frame("Master-outline1", x, y, w, h, this.listXml(b.items), "outline")
+                return this.frame("Master-outline1", x, y, w, h, this.listXml(b.items, "Master-outline1"), "outline")
             case "quote":
                 return this.frame("Citation", x, y, w, h, `<text:p>${runsXml(b.text)}</text:p>`)
             case "prompt":
@@ -939,8 +1282,13 @@ class Builder {
                 return this.promptXml(b.lines, x + w - pw, y, pw, h, b.t === "prompt" ? "Prompt" : "Code")
             }
             case "table": {
-                const tw = Math.min(w, tableCols(b.header, b.rows, w).reduce((a, c) => a + c, 0))
-                return this.tableXml(b.header, b.rows, x, y, tw, sizes.table)
+                const pw = tablePartW(b, w)
+                const cols = tableBlockCols(b, w)
+                return tableParts(b)
+                    .map((rows, i) =>
+                        this.tableXml(b.header, rows, x + i * (pw + TABLE_GAP), y, pw, b.pt ?? sizes.table, false, cols, (r, c) => isHidden(b, r, c)),
+                    )
+                    .join("")
             }
             default:
                 throw new Error(`Unexpected block ${b.t}`)
@@ -954,16 +1302,17 @@ class Builder {
         const texts = blocks.filter(b => b.t !== "image")
         const shapes: string[] = []
 
-        const stack = (bs: Block[], x: number, width: number): number => {
-            let y = Y0
+        const sumH = (width: number) => texts.reduce((h, b) => h + blockH(b, width), 0) + GAP * (texts.length - 1)
+        const stack = (bs: Block[], x: number, width: number, center = CENTER): number => {
+            const top = center ? Y0 + Math.max(0, (H - sumH(width)) / 2) : Y0
+            let y = top
             for (const b of bs) {
                 const bh = blockH(b, width)
                 shapes.push(this.blockXml(b, x, y, width, Math.min(bh, Math.max(Y0 + H - y, 1.5))))
                 y += bh + GAP
             }
-            return y - Y0 - (bs.length ? GAP : 0)
+            return y - top - (bs.length ? GAP : 0)
         }
-        const sumH = (width: number) => texts.reduce((h, b) => h + blockH(b, width), 0) + GAP * (texts.length - 1)
 
         if (!imgs.length) return [stack(texts, X0, W), shapes]
         const src = imgs[0].src
@@ -974,7 +1323,8 @@ class Builder {
             return [0, shapes]
         }
         if (iw / ih >= 1.8 || (iw / ih >= 1.2 && sumH(W) < 2.5)) {
-            const th = stack(texts, X0, W)
+            // The image below the text takes the free height.
+            const th = stack(texts, X0, W, false)
             const avail = Math.max(H - th - GAP, 4.5)
             const [w, h] = fit(iw, ih, W, avail)
             shapes.push(this.imageXml(src, X0 + (W - w) / 2, Y0 + th + GAP + (avail - h) / 2, w, h))
@@ -997,17 +1347,118 @@ class Builder {
                 slides[slides.length - 1][1].push(b.text)
                 continue
             }
+            if (b.t === "table" && (!this.fits([b]) || ((b.compact || b.reveal) && !headerFits(b)))) {
+                // A revealed table must stay on one slide: on two side-by-side tables, or else shrunk.
+                if (b.reveal) this.twoColumns(b, slides) || this.compactTable(b, slides)
+                else if (b.compact) this.compactTable(b, slides)
+                else this.splitTable(b, slides)
+                continue
+            }
             const cur = slides[slides.length - 1][0]
             const hasImg = cur.some(x => x.t === "image")
-            if (cur.length && ((b.t === "image" && hasImg) || this.layout([...cur, b])[0] > H)) {
-                // Keep an introductory paragraph with what follows it.
-                const carry = cur.length > 1 && cur[cur.length - 1].t === "para" ? [cur.pop()!] : []
-                slides.push([[...carry, b], []])
+            if (cur.length && ((b.t === "image" && hasImg) || !this.fits([...cur, b]))) {
+                slides.push([[...this.carry(cur, b), b], []])
             } else {
                 cur.push(b)
             }
         }
         return slides.filter(([c, n]) => c.length || n.length)
+    }
+
+    /** Do these blocks fit on one slide? */
+    fits(blocks: Block[]): boolean {
+        // `layout()` registers the automatic styles of the shapes it builds: forget those of this trial.
+        const saved = [new Map(this.colStyles), new Map(this.rowStyles), new Map(this.paraStyles)]
+        const ok = this.layout(blocks)[0] <= H
+        ;[this.colStyles, this.rowStyles, this.paraStyles] = saved
+        return ok
+    }
+
+    /**
+     * Keep an introductory paragraph with the block `next` that starts a new slide:
+     * the last paragraph of `cur`, removed from it, if it fits with `next`.
+     */
+    carry(cur: Block[], next: Block): Block[] {
+        const last = cur[cur.length - 1]
+        return cur.length > 1 && last.t === "para" && this.fits([last, next]) ? [cur.pop()!] : []
+    }
+
+    /**
+     * A `@compact` table too long for one slide: its text is shrunk (by steps of half a point)
+     * until it fits on a slide with the paragraph introducing it, if any. It stays on the current
+     * slide if it fits there at that size, otherwise it starts a new one with its introduction.
+     */
+    compactTable(b: TableBlock, slides: [Block[], string[]][]) {
+        const MIN_PT = 4
+        const cur = slides[slides.length - 1][0]
+        const last = cur[cur.length - 1]
+        const intro = last?.t === "para" ? [last] : []
+        const shrink = (t: TableBlock): TableBlock => {
+            let small: TableBlock = t
+            for (let pt = sizes.table - 0.5; pt >= MIN_PT; pt -= 0.5) {
+                small = { ...t, pt }
+                if (this.fits([...intro, small]) && headerFits(small)) break
+            }
+            return small
+        }
+        let small = shrink(b)
+        // A revealed table can also be spread over two side-by-side tables, if its text stays bigger.
+        if (b.reveal && b.rows.length > 1) {
+            const two = shrink({ ...b, columns: 2 })
+            const ok = (t: TableBlock) => this.fits([t]) && headerFits(t)
+            if ((two.pt ?? sizes.table) > (small.pt ?? sizes.table) || !ok(small)) small = two
+        }
+        const pragma = b.reveal ? "@reveal" : "@compact"
+        if (!this.fits([small])) console.warn(`  ! a ${pragma} table is still too long at ${MIN_PT}pt: it overflows its slide`)
+        else if (!headerFits(small)) console.warn(`  ! a ${pragma} table still has header words too long for their column at ${MIN_PT}pt`)
+        if (!cur.length || this.fits([...cur, small])) return void cur.push(small)
+        const carry = cur.length > 1 && intro.length && this.fits([...intro, small]) ? [cur.pop()!] : []
+        slides.push([[...carry, small], []])
+    }
+
+    /**
+     * Spread the rows of a table over two side-by-side tables, if they fit on one slide: on the
+     * current slide if there is room, otherwise on a new one. Return false if they do not fit.
+     */
+    twoColumns(b: TableBlock, slides: [Block[], string[]][]): boolean {
+        if (b.rows.length < 2) return false
+        const cur = slides[slides.length - 1][0]
+        const two: TableBlock = { ...b, columns: 2 }
+        // Narrower columns must not cut the words of the header of a `@compact` or `@reveal` table.
+        if ((b.compact || b.reveal) && !headerFits(two)) return false
+        if (cur.length && this.fits([...cur, two])) cur.push(two)
+        else if (!this.fits([two])) return false
+        else if (!cur.length) cur.push(two)
+        else slides.push([[...this.carry(cur, two), two], []])
+        return true
+    }
+
+    /**
+     * A table too long for one slide: its rows are spread over two side-by-side tables if they fit
+     * on one slide, otherwise over several slides. The header is repeated on each part.
+     */
+    splitTable(b: TableBlock, slides: [Block[], string[]][]) {
+        if (this.twoColumns(b, slides)) return
+        const cur = () => slides[slides.length - 1][0]
+        const ref = b.rows
+        let rest = b.rows
+        while (rest.length) {
+            const part = (k: number): TableBlock => ({ ...b, rows: rest.slice(0, k), ref })
+            const c = cur()
+            let k = 0
+            while (k < rest.length && this.fits([...c, part(k + 1)])) k++
+            if (!k && c.length) {
+                // Not even one row fits under the current content: start on a new slide.
+                const last = c[c.length - 1]
+                slides.push([c.length > 1 && last.t === "para" ? [c.pop()!] : [], []])
+                continue
+            }
+            // A single row taller than the slide still has to go somewhere.
+            k = Math.max(k, 1)
+            c.push(part(k))
+            rest = rest.slice(k)
+            if (rest.length) slides.push([[], []])
+        }
     }
 
     // -- pages
@@ -1023,64 +1474,43 @@ class Builder {
     }
 
     sectionPage(sec: Section) {
-        const crumbs = sec.path().slice(0, -1)
-        const shapes = [this.frame("Section-title", 2, 5, 24, 3.5, `<text:p>${xmlText(sec.title)}</text:p>`, "title", this.takeHints())]
-        if (crumbs.length)
-            shapes.push(this.frame("Section-subtitle", 2, 8.8, 24, 1.5, `<text:p>${xmlText(crumbs.join(" › "))}</text:p>`, "subtitle"))
+        // The big title is always the top-level (`#`) heading; deeper headings go in the subtitle.
+        const [title, ...rest] = sec.path()
+        const shapes = [this.frame("Section-title", 2, 5, 24, 3.5, `<text:p>${xmlText(title)}</text:p>`, "title", this.takeHints())]
+        if (rest.length)
+            shapes.push(this.frame("Section-subtitle", 2, 8.8, 24, 1.5, `<text:p>${xmlText(rest.join(" › "))}</text:p>`, "subtitle"))
         const notes = sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : []))
         this.page("Section", shapes, notes)
     }
 
     contentPages(title: string, crumbs: string[], blocks: Block[]) {
-        for (const [content, notes] of this.paginate(blocks)) {
-            const [, shapes] = this.layout(content)
-            this.page("Master", [...this.titleShapes(title, crumbs), ...shapes], notes)
-        }
-    }
-
-    /** A table whose rows appear one slide after the other. */
-    revealTable(sec: Section, crumbs: string[]) {
-        const table = sec.blocks.find(b => b.t === "table")
-        if (!table || table.t !== "table") return this.contentPages(sec.title, crumbs, sec.blocks)
-        const header = (table.header ?? []).map(stripMd)
-        const rows = table.rows
-        const ncol = Math.max(header.length, ...rows.map(r => r.length))
-        const hasLogos = rows.some(r => /<img\s/.test(r[0] ?? ""))
-        const widths = tableCols(header, rows.map(r => (hasLogos ? ["Logo", ...r.slice(1)] : r)), Math.min(W, 4.5 * ncol))
-        const tw = widths.reduce((a, b) => a + b, 0)
-        const x = X0 + (W - tw) / 2
-        const rh = 1.3
-        const hh = 1.1
-        for (let k = 0; k <= rows.length; k++) {
-            const parts = [
-                `<draw:frame draw:style-name="Tableau-cadre" ${Builder.geom(x, Y0, tw, hh + rh * rows.length)}>`,
-                '<table:table table:template-name="Tableau" table:use-first-row-styles="true" table:use-banding-rows-styles="true">',
-                ...widths.map(cw => `<table:table-column table:style-name="${this.colStyle(cw)}"/>`),
-                `<table:table-row table:style-name="${this.rowStyle(hh)}">`,
-                ...widths.map((_, c) => `<table:table-cell table:style-name="Tableau-entete"><text:p>${xmlText(header[c] ?? "")}</text:p></table:table-cell>`),
-                "</table:table-row>",
-            ]
-            rows.forEach((r, i) => {
-                const st = i % 2 === 0 ? "Tableau-cellule" : "Tableau-cellule-alt"
-                parts.push(`<table:table-row table:style-name="${this.rowStyle(rh)}">`)
-                widths.forEach((_, c) => {
-                    const cell = i < k && !(hasLogos && c === 0) ? (r[c] ?? "") : ""
-                    parts.push(`<table:table-cell table:style-name="${st}"><text:p>${runsXml(cell)}</text:p></table:table-cell>`)
-                })
-                parts.push("</table:table-row>")
-            })
-            parts.push("</table:table></draw:frame>")
-            const shapes = [parts.join("")]
-            for (let i = 0; i < k; i++) {
-                const m = (rows[i][0] ?? "").match(/src="([^"]+)"/)
-                if (m) {
-                    const s = 1.0
-                    shapes.push(this.imageXml(m[1], x + (widths[0] - s) / 2, Y0 + hh + rh * i + (rh - s) / 2, s, s))
+        // Notes not attached to a slide yet: they go to the next one.
+        const pending: string[] = []
+        let run: Block[] = []
+        const flush = () => {
+            for (const [content, notes] of this.paginate(run)) {
+                if (!content.length) {
+                    pending.push(...notes)
+                    continue
+                }
+                const allNotes = [...pending.splice(0), ...notes]
+                for (const step of revealSteps(content)) {
+                    const [, shapes] = this.layout(step)
+                    this.page("Master", [...this.titleShapes(title, crumbs), ...shapes], [...allNotes])
                 }
             }
-            const notes = k === 0 ? sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : [])) : []
-            this.page("Master", [...this.titleShapes(sec.title, crumbs), ...shapes], notes)
+            run = []
         }
+        // An `@layout` of blocks gets its own slide, between the slides of the blocks around it.
+        for (const b of blocks) {
+            if (b.t !== "layout") run.push(b)
+            else if (b.cells.length) {
+                flush()
+                this.layoutPage(title, crumbs, b.cells, b.layout, pending.splice(0))
+            }
+        }
+        flush()
+        if (pending.length) this.pages[this.pages.length - 1].notes.push(...pending)
     }
 
     /** Height of a group of paragraphs/lists rendered at `pt` points. */
@@ -1104,7 +1534,7 @@ class Builder {
                 const all = b.header ? [b.header, ...b.rows] : b.rows
                 const ncol = Math.max(...all.map(r => r.length))
                 let tw = 0
-                for (let c = 0; c < ncol; c++) tw += Math.max(...all.map(r => Math.min(plainLen(r[c] ?? ""), 30))) * cw(sizes.tableSmall) + 0.6
+                for (let c = 0; c < ncol; c++) tw += Math.max(...all.map(r => Math.min(plainLen(cell(r[c] ?? "").text), 30))) * cw(sizes.tableSmall) + 0.6
                 w = Math.max(w, tw)
             } else if (b.t === "image") {
                 const [iw, ih] = imageSize(resolve(sec.source, b.src))
@@ -1120,7 +1550,7 @@ class Builder {
         type Item = { kind: "text"; blocks: Block[] } | { kind: "block"; block: Block }
         const items: Item[] = []
         for (const b of sec.blocks) {
-            if (b.t === "note") continue
+            if (b.t === "note" || b.t === "layout") continue
             const last = items[items.length - 1]
             if (b.t === "para" || b.t === "list" || b.t === "quote") {
                 if (last?.kind === "text") last.blocks.push(b)
@@ -1161,7 +1591,7 @@ class Builder {
             const ih = Math.max(0.5, Math.min(heights[i], y + h - cy))
             if (it.kind === "text") {
                 const inner = it.blocks
-                    .map(b => (b.t === "list" ? this.listXml(b.items) : b.t === "para" || b.t === "quote" ? `<text:p>${runsXml(b.text)}</text:p>` : ""))
+                    .map(b => (b.t === "list" ? this.listXml(b.items, textStyle) : b.t === "para" || b.t === "quote" ? `<text:p>${runsXml(b.text)}</text:p>` : ""))
                     .join("")
                 shapes.push(this.frame(textStyle, x, cy, w, ih, inner))
             } else {
@@ -1184,9 +1614,8 @@ class Builder {
     }
 
     /** Sections laid out on a single slide, following an `@layout` pragma. */
-    layoutPage(parent: Section, group: Section[], layout: Layout, notes: string[]) {
-        const title = parent.level > 0 ? parent.title : group[0].title
-        const shapes = this.titleShapes(title, parent.path().slice(0, -1))
+    layoutPage(title: string, crumbs: string[], group: Section[], layout: Layout, notes: string[]) {
+        const shapes = this.titleShapes(title, crumbs)
         const headH = 0.9
         let cells: { x: number; y: number; w: number; h: number }[]
         if (layout.kind === "grid") {
@@ -1233,8 +1662,10 @@ class Builder {
                 layout.kind === "grid"
                     ? [`Grille-titre-${(n % colors) + 1}`, `Grille-texte-${(n % colors) + 1}`, sizes.gridText]
                     : ["Colonne-titre", "Colonne-texte", sizes.columnText]
-            shapes.push(this.frame(headStyle, x, y, w, headH, `<text:p>${xmlText(sec.title)}</text:p>`))
-            shapes.push(...this.cellXml(sec, x, y + headH, w, h - headH, textStyle, textPt))
+            // Cells of an `@layout` of blocks have no heading.
+            const hh = sec.title ? headH : 0
+            if (sec.title) shapes.push(this.frame(headStyle, x, y, w, hh, `<text:p>${xmlText(sec.title)}</text:p>`))
+            shapes.push(...this.cellXml(sec, x, y + hh, w, h - hh, textStyle, textPt))
             notes.push(...sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : [])))
         })
         this.page("Master", shapes, notes)
@@ -1246,11 +1677,9 @@ class Builder {
         const content = sec.blocks.filter(b => b.t !== "note")
         // A section whose only content is a grouped slide does not get its own divider slide.
         const groupedOnly = !content.length && sec.children[0]?.layout != null
-        if (sec.level === 1) {
+        if (sec.level === 1 && !sec.continued) {
             this.sectionPage(sec)
             if (content.length) this.contentPages(sec.title, [...crumbs, sec.title], sec.blocks)
-        } else if (sec.hints.some(h => h.includes("revealed line by line"))) {
-            this.revealTable(sec, crumbs)
         } else if (content.length) {
             this.contentPages(sec.title, crumbs, sec.blocks)
         } else if (sec.children.length && !groupedOnly) {
@@ -1270,7 +1699,8 @@ class Builder {
             }
             const group = children.slice(i, i + cellCount(layout))
             for (const g of group) this.pendingHints.push(...g.hints)
-            this.layoutPage(sec, group, layout, i === 0 ? notes : [])
+            const title = sec.level > 0 ? sec.title : group[0].title
+            this.layoutPage(title, sec.path().slice(0, -1), group, layout, i === 0 ? notes : [])
             // Sub-sections of grouped sections still get their own slides.
             for (const g of group) this.walkChildren(g)
             i += group.length - 1
@@ -1315,6 +1745,39 @@ function bulletsXml(def: BulletDef, name: string): string {
     return `<text:list-style style:name="${esc(name)}-list">${levels.join("")}</text:list-style>`
 }
 
+/** `name` or its nearest parent style defining both `bullets` and `numbers`, if any. */
+function listStyleHolder(name: string): string | null {
+    for (let n: string | undefined = name, depth = 0; n && depth < 20; depth++) {
+        const s: StyleDef | undefined = style.styles[n]
+        if (s?.bullets && s.numbers) return n
+        n = s?.parent
+    }
+    return null
+}
+
+/** Level of a numbered list style: `1.`, `a.`, `i.`... */
+function numbersXml(def: NumberDef, name: string): string {
+    const where = `numbers of style "${name}"`
+    const levels = def.formats.map(
+        (format, i) =>
+            `<text:list-level-style-number text:level="${i + 1}" style:num-format="${esc(format)}" style:num-suffix="${esc(def.suffix)}">` +
+            `<style:list-level-properties text:space-before="${f2(def.indent * i)}cm" text:min-label-width="${f2(def.width)}cm"/>` +
+            `<style:text-properties style:use-window-font-color="false" fo:color="${esc(resolveValue(def.color, where))}" ` +
+            `fo:font-size="${esc(resolveValue(def.size, where))}" fo:font-weight="${esc(resolveValue(def.weight, where))}"/>` +
+            `</text:list-level-style-number>`,
+    )
+    return `<text:list-style style:name="${esc(name)}-numbers">${levels.join("")}</text:list-style>`
+}
+
+/**
+ * Named list styles `<name>-bullets` and `<name>-numbers` of a style holding numbered lists:
+ * lists mixing bullets and numbers name them explicitly (see `Builder.listXml()`).
+ */
+function listStylesXml(name: string, s: StyleDef): string {
+    if (!s.bullets || !s.numbers) return ""
+    return bulletsXml(s.bullets, name).replace(`style:name="${esc(name)}-list"`, `style:name="${esc(name)}-bullets"`) + numbersXml(s.numbers, name)
+}
+
 function styleXml(name: string, s: StyleDef): string {
     const parent = s.parent ? ` style:parent-style-name="${esc(s.parent)}"` : ""
     const list = s.bullets ? bulletsXml(s.bullets, name) : ""
@@ -1327,7 +1790,41 @@ function styleXml(name: string, s: StyleDef): string {
     )
 }
 
-function stylesXml(): string {
+const backgroundStyle = (master: string) => `M${master}-image`
+
+/**
+ * LibreOffice ignores image adjustments (`draw:image-opacity`, `draw:color-mode`...) inherited
+ * from a named style, so the master images get an automatic style repeating them.
+ */
+function backgroundStyleXml(master: "Master" | "Section"): string {
+    const name = `${master}-image`
+    return (
+        `<style:style style:name="${backgroundStyle(master)}" style:family="graphic" style:parent-style-name="${name}">` +
+        `<style:graphic-properties ${attrs(style.styles[name]?.graphic, `style "${name}"`)}/></style:style>`
+    )
+}
+
+/** Frame of the image of a master page (see `theme.backgrounds`), or "" if it has none. */
+function backgroundXml(b: Builder, master: "Master" | "Section"): string {
+    const bg: BackgroundImage = style.theme.backgrounds[master]
+    if (!bg.image) return ""
+    const { href, size } = b.picture(bg.image)
+    let { x = 0, y = 0, width: w = SLIDE_W, height: h = SLIDE_H } = bg
+    if (bg.fit === "contain") {
+        const scale = Math.min(w / size[0], h / size[1])
+        x += (w - size[0] * scale) / 2
+        y += (h - size[1] * scale) / 2
+        w = size[0] * scale
+        h = size[1] * scale
+    }
+    return (
+        `<draw:frame draw:style-name="${backgroundStyle(master)}" ${Builder.geom(x, y, w, h)}>` +
+        `<draw:image xlink:href="${esc(href)}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>` +
+        `</draw:frame>`
+    )
+}
+
+function stylesXml(b: Builder): string {
     const templates = style.tableTemplates.map(
         t =>
             `<table:table-template table:name="${esc(t.name)}">` +
@@ -1346,6 +1843,8 @@ function stylesXml(): string {
         `<style:page-layout style:name="PM1"><style:page-layout-properties fo:margin-top="0cm" fo:margin-bottom="0cm" fo:margin-left="0cm" fo:margin-right="0cm" fo:page-width="${SLIDE_W}cm" fo:page-height="${SLIDE_H}cm" style:print-orientation="landscape"/></style:page-layout>`,
         `<style:page-layout style:name="PM2"><style:page-layout-properties fo:margin-top="0cm" fo:margin-bottom="0cm" fo:margin-left="0cm" fo:margin-right="0cm" fo:page-width="21cm" fo:page-height="29.7cm" style:print-orientation="portrait"/></style:page-layout>`,
         `<style:style style:name="Mdp1" style:family="drawing-page"><style:drawing-page-properties draw:background-size="full" draw:fill="solid" draw:fill-color="#FFFFFF"/></style:style>`,
+        backgroundStyleXml("Master"),
+        backgroundStyleXml("Section"),
     ]
     const notes = (m: string) =>
         `<presentation:notes style:page-layout-name="PM2">` +
@@ -1356,6 +1855,7 @@ function stylesXml(): string {
         `<draw:frame presentation:style-name="${styleName}" presentation:class="${cls}" presentation:placeholder="true" ${Builder.geom(x, y, w, h)}><draw:text-box/></draw:frame>`
     const masters = [
         `<style:master-page style:name="Master" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
+            backgroundXml(b, "Master") +
             `<draw:rect draw:style-name="Decor" ${Builder.geom(0, 0, 0.4, SLIDE_H)}/>` +
             `<draw:line draw:style-name="Decor-ligne" svg:x1="${X0}cm" svg:y1="2.7cm" svg:x2="${X0 + W}cm" svg:y2="2.7cm"/>` +
             placeholder("Master-title", "title", X0, 0.95, W, 1.6) +
@@ -1363,6 +1863,7 @@ function stylesXml(): string {
             `${notes("Master")}</style:master-page>`,
         `<style:master-page style:name="Section" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
             `<draw:rect draw:style-name="Section-fond" ${Builder.geom(0, 0, SLIDE_W, SLIDE_H)}/>` +
+            backgroundXml(b, "Section") +
             `<draw:rect draw:style-name="Decor" ${Builder.geom(0, 8.55, SLIDE_W, 0.12)}/>` +
             placeholder("Section-title", "title", 2, 5, 24, 3.5) +
             placeholder("Section-subtitle", "subtitle", 2, 8.8, 24, 1.5) +
@@ -1381,15 +1882,15 @@ function contentXml(b: Builder): string {
         ([name, props]) =>
             `<style:style style:name="${esc(name)}" style:family="text"><style:text-properties ${attrs(props, `span style "${name}"`)}/></style:style>`,
     )
+    // Impress only finds the list styles named by `<text:list>` among the automatic styles.
+    for (const [name, s] of Object.entries(style.styles)) auto.push(listStylesXml(name, s))
     for (const [key, name] of b.colStyles)
         auto.push(`<style:style style:name="${name}" style:family="table-column"><style:table-column-properties style:column-width="${key}cm"/></style:style>`)
-    for (const { name, parent, graphic } of b.autoStyles.values())
-        auto.push(
-            `<style:style style:name="${name}" style:family="graphic" style:parent-style-name="${esc(parent)}">` +
-                `<style:graphic-properties ${attrs(graphic)}/></style:style>`,
-        )
-    for (const { name, text } of b.paraStyles.values())
-        auto.push(`<style:style style:name="${name}" style:family="paragraph"><style:text-properties ${attrs(text)}/></style:style>`)
+    for (const [key, name] of b.paraStyles) {
+        const [pt, indent] = key.split("/")
+        const para = indent ? `<style:paragraph-properties fo:margin-left="${indent}cm"/>` : ""
+        auto.push(`<style:style style:name="${name}" style:family="paragraph">${para}<style:text-properties fo:font-size="${pt}pt"/></style:style>`)
+    }
     for (const [key, name] of b.rowStyles)
         auto.push(`<style:style style:name="${name}" style:family="table-row"><style:table-row-properties style:row-height="${key}cm"/></style:style>`)
     const pages = b.pages.map(({ master, shapes, notes }, i) => {
@@ -1460,8 +1961,12 @@ function zip(entries: { name: string; data: Buffer; store?: boolean }[]): Buffer
     return Buffer.concat([...locals, cd, end])
 }
 
-function writeOdp(b: Builder, out: string, title: string) {
+async function writeOdp(b: Builder, out: string, title: string) {
+    // Before listing the pictures: the master pages can add some.
+    const styles = stylesXml(b)
+    const content = contentXml(b)
     const pics = [...b.pictures.values()]
+    await encodePictures(pics)
     const manifest =
         '<?xml version="1.0" encoding="UTF-8"?><manifest:manifest xmlns:manifest="urn:oasis:names:tc:opendocument:xmlns:manifest:1.0" manifest:version="1.3">' +
         '<manifest:file-entry manifest:full-path="/" manifest:media-type="application/vnd.oasis.opendocument.presentation"/>' +
@@ -1480,8 +1985,8 @@ function writeOdp(b: Builder, out: string, title: string) {
             { name: "mimetype", data: text("application/vnd.oasis.opendocument.presentation"), store: true },
             { name: "META-INF/manifest.xml", data: text(manifest) },
             { name: "meta.xml", data: text(meta) },
-            { name: "styles.xml", data: text(stylesXml()) },
-            { name: "content.xml", data: text(contentXml(b)) },
+            { name: "styles.xml", data: text(styles) },
+            { name: "content.xml", data: text(content) },
             ...pics.map(p => ({ name: p.href, data: p.data, store: true })),
         ]),
     )
@@ -1504,13 +2009,13 @@ function countHints(sec: Section): number {
     return sec.hints.length + sec.children.reduce((n, c) => n + countHints(c), 0)
 }
 
-function convert(src: string, config: StyleConfig): { out: string; hints: number } {
+async function convert(src: string, config: StyleConfig): Promise<{ out: string; hints: number }> {
     useStyle(config)
     const root = parse(readFileSync(src, "utf8"), src)
     const b = new Builder(dirname(src))
     b.walkChildren(root)
     const out = src.replace(/\.md$/i, ".odp")
-    writeOdp(b, out, basename(src, extname(src)))
+    await writeOdp(b, out, basename(src, extname(src)))
     return { out, hints: countHints(root) }
 }
 
@@ -1520,7 +2025,7 @@ function aiPrompt(files: string[]): string {
     return [
         rule,
         `Refine ${files.length > 1 ? "these LibreOffice Impress presentations" : "this LibreOffice Impress presentation"}:`,
-        ...files.map(f => `  - ${f}`),
+        ...files.map(f => `  - ${bold(f)}`),
         "",
         "An .odp file is a ZIP archive. In its content.xml, some slide titles carry",
         "layout instructions in their alt-text description: <svg:desc> elements whose",
@@ -1549,7 +2054,11 @@ const PRAGMAS: [string, string][] = [
     ["@hint <text>", "Instruction for an AI: stored verbatim in the .odp (alt-text of the slide title), never displayed."],
     ["@layout grid <C>x<R>", "Put the next C×R sections (starting at the next heading) on one slide, in a grid."],
     ["@layout columns <sizes>", 'Put the next sections on one slide, in columns sized "1fr", "2fr"... or "auto" (one size per section).'],
-    ["@graph <file.dot>", "Insert a Graphviz diagram (path relative to the .md) as native shapes editable in Impress."],
+    ["@layout ... (no heading after)", "Put the next blocks (paragraph, list, image...) of the section on one slide, one per cell, without headings."],
+    ["@graph <file.dot>", "Insert a Graphviz diagram (path relative to the .md), rendered as a PNG image by dot."],
+    ["@next", "Start a new slide with the same title as the current one (unless a heading follows)."],
+    ["@compact", "Shrink the next table so that it fits on one slide, instead of splitting it."],
+    ["@reveal [C<cols>] [R<rows>]", 'Reveal the rows of the next table one slide after the other; "C1,3 R1-4" keeps columns 1 and 3 and rows 1 to 4 always visible.'],
     ["```prompt ... ```", "Not a pragma: a code block shown as a chat prompt bubble."],
 ]
 
@@ -1576,22 +2085,22 @@ async function main(args: string[]) {
         return
     }
     const files = args.filter(f => f.toLowerCase().endsWith(".md"))
-    for (const f of args) if (!files.includes(f)) console.warn(`Ignoring ${f}: not a .md file`)
+    for (const f of args) if (!files.includes(f)) console.warn(`Ignoring ${bold(f)}: not a .md file`)
     if (!files.length) {
         console.error("No .md file given. Run without arguments for help.")
         process.exit(1)
     }
-    await loadGraphviz()
     const withHints: [string, number][] = []
     let failed = false
     for (const file of files) {
         const src = resolve(file)
-        console.log(`Processing ${src}`)
+        console.log(`Processing ${bold(src)}`)
         try {
+            if (existsSync(src) && usesGraph(src)) await ensureDot()
             const { config, path, created } = loadStyle(src)
-            console.log(created ? `  + ${path} (created with the default style)` : `  ⚙ ${path}`)
-            const { out, hints } = convert(src, config)
-            console.log(`  → ${out} (${humanSize(statSync(out).size)})`)
+            console.log(created ? `  + ${bold(path)} (created with the default style)` : `  ⚙ ${bold(path)}`)
+            const { out, hints } = await convert(src, config)
+            console.log(`  → ${bold(out)} (${humanSize(statSync(out).size)})`)
             if (hints) withHints.push([out, hints])
         } catch (err) {
             failed = true
@@ -1601,9 +2110,9 @@ async function main(args: string[]) {
     if (withHints.length) {
         console.log("\nThese presentations contain @hint pragmas (stored in the slide titles' alt-text descriptions)")
         console.log("and can be refined with AI:")
-        for (const [out, n] of withHints) console.log(`  - ${out} (${n} hint${n > 1 ? "s" : ""})`)
+        for (const [out, n] of withHints) console.log(`  - ${bold(out)} (${n} hint${n > 1 ? "s" : ""})`)
         console.log("\nExample of prompt to give to an AI agent able to read and write files:\n")
-        console.log(aiPrompt(withHints.map(([out]) => out)))
+        console.log(cyan(aiPrompt(withHints.map(([out]) => out))))
     }
     if (failed) process.exit(1)
 }

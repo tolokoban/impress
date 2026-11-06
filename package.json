@@ -1,6 +1,6 @@
 {
     "name": "@tolokoban/impress",
-    "version": "0.1.0",
+    "version": "0.13.0",
     "description": "Convert teaching markdown files into LibreOffice Impress presentations (.odp)",
     "type": "module",
     "bin": {
@@ -41,11 +41,11 @@
     "publishConfig": {
         "access": "public"
     },
-    "dependencies": {
-        "@hpcc-js/wasm-graphviz": "1.30.0"
-    },
     "devDependencies": {
         "@types/node": "^24.19.2",
         "typescript": "^7.0.2"
+    },
+    "dependencies": {
+        "sharp": "0.35.5"
     }
 }

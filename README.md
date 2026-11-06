@@ -8,11 +8,34 @@ npx @tolokoban/impress course.md [other.md ...]
 
 Each `foo.md` produces `foo.odp` in the same folder. Run it without arguments to see the help.
 
+`@graph` diagrams are laid out by the [Graphviz](https://graphviz.org/) `dot` tool. When a file uses `@graph` and `dot` is not installed, `impress` offers to install it with the package manager of the system:
+
+| System | Command |
+| --- | --- |
+| Linux | `apt-get`, `dnf`, `yum`, `pacman`, `zypper`, `apk` or `brew` (with `sudo` when needed) |
+| macOS | `brew install graphviz` or `sudo port install graphviz` |
+| Windows | `winget install Graphviz.Graphviz`, `choco install graphviz` or `scoop install graphviz` |
+
+Without a known package manager (or in a non-interactive shell), it prints how to install it instead, and the presentations using `@graph` fail.
+
+Each time `dot` renders a diagram, the exact command is printed after a bold cyan `>`, so you can run it yourself to check the PNG:
+
+```
+  > /usr/bin/dot -Tpng -Gdpi=300 -Gbgcolor=transparent "-Gfontname=Liberation Sans" … diagram.dot
+```
+
+In a terminal, the output is colored: file names in bold, the example of AI prompt (printed when the files contain `@hint` pragmas) in cyan, and the questions waiting for an answer in bright yellow. Set the `NO_COLOR` environment variable (or redirect the output) to disable the colors.
+
 ## Slides
 
 - `#` headings become section slides (blue background).
-- Deeper headings become content slides, split over several slides when they are too long.
+- Deeper headings become content slides, split over several slides when they are too long. A deeper heading with no content of its own, only sub-headings, gets a section slide too: its big title is still the `#` heading above it, and the deeper heading goes in the subtitle (e.g. `Possibilités`).
 - Paragraphs, lists, tables, blockquotes and images are laid out automatically: images go beside or below the text depending on their shape.
+- A table too long for one slide is first spread over two side-by-side tables on the same slide. If that is still too long, it is split over several slides. In both cases the header row is repeated on each part, and every part keeps the same column widths. Put `@compact` before the table to shrink it onto one slide instead (see [Pragmas](#pragmas)).
+- Table cells can hold images, as HTML (`<img src="logos/claude.webp" alt="Claude" width="48" height="48">`) or markdown (`![Claude](logos/claude.webp)`). Their pixel sizes assume a 16px font: a 48px image is 3 times as tall as the text of the table, and it shrinks with the text of a `@compact` table. With only `width` or `height`, the other one follows the shape of the image; with neither, the image is 2 lines tall. An image alone in its cell is centered, otherwise it comes before the text. Images too wide for their column are shrunk to fit.
+- Every image embedded in the `.odp` (PNG, JPEG, SVG, `@graph` diagrams, background images) is converted to WebP, at quality 70 by default (see [`theme.images`](#themeimages)). The `.odp` stays light, and SVG files look in the slides as they do in a browser, since they are rasterized before LibreOffice sees them.
+- Lists can be bulleted (`- item`, `* item`) or numbered (`1. item`, `1) item`), and the two can be nested in each other. A numbered list starts at the number of its first item (`4.` starts at 4); the number of each following item is computed, not read. Numbered items get numbers `1.`, then letters `a.` and roman numerals `i.` when nested (see [Numbers](#numbers)).
+- Blockquotes (`> ...`) are shown in a bordered box with a soft blurred shadow.
 - A code block whose language is `prompt` is shown as a chat bubble.
 
 ## Pragmas
@@ -26,7 +49,11 @@ At the start of a line in the `.md` file:
 | `@hint <text>` | Instruction for an AI: stored verbatim in the `.odp` (alt-text of the slide title), never displayed. |
 | `@layout grid <C>x<R>` | Put the next C×R sections (starting at the next heading) on one slide, in a grid. |
 | `@layout columns <sizes>` | Put the next sections on one slide, in columns sized `1fr`, `2fr`… or `auto` (one size per section). |
-| `@graph <file.dot>` | Insert a Graphviz diagram (path relative to the `.md`) as native shapes, editable in Impress without the `.dot` file. |
+| `@layout …` *(not followed by a heading)* | Put the next blocks of the section (paragraph, list, image, table…) on one slide, one block per cell, without cell headings. |
+| `@graph <file.dot>` | Insert a Graphviz diagram (path relative to the `.md`), rendered by `dot -Tpng` (the same Cairo renderer as DOT viewers, so the diagram looks the same in the slides) and embedded in the `.odp` as a WebP image. The fonts, sizes and colors of the theme are inserted as `graph [...]`, `node [...]` and `edge [...]` defaults at the start of the graph, so every attribute set in the `.dot` file wins, including its own `node [...]` / `edge [...]` defaults. |
+| `@next` | Start a new slide with the same title as the current one. If the next line is a heading (`#`, `##`…), that heading gives the new slide its title instead. |
+| `@compact` | The next table of the section, if it is too long for one slide, has its text shrunk (down to 4pt) until it fits on one slide with the paragraph introducing it, instead of being split into two columns or over several slides. The words of the header are never cut: if one of them is too long for its column, the text is shrunk further, even when the table would fit at full size (a header cell of several words may still wrap between words). |
+| `@reveal [C<columns>] [R<rows>]` | The rows of the next table appear one slide after the other: the first slide shows only the header, each following slide reveals one more row. The table keeps its final size and place from the first slide. `C` and `R` list the columns and the body rows (counted from 1, header excluded) that are always visible, as numbers and ranges: `@reveal C1,3 R1-4` always shows columns 1 and 3 and rows 1 to 4. Both are optional. The speaker notes are repeated on every slide of the sequence. A revealed table always stays on one slide, and its header words are never cut, as with `@compact`: if it is too long, its rows are first spread over two side-by-side tables, and if that is still too long, its text is shrunk, on one table or two side by side, whichever keeps the text bigger. A table inside an `@layout` is shown entirely. |
 
 When some files contain `@hint`, the end of the output gives a ready-to-paste prompt asking an AI agent to apply them to the `.odp`.
 
@@ -137,7 +164,7 @@ Text boxes shrink their text when it does not fit (`style:shrink-to-fit`), so a 
 Geometry, in centimeters.
 
 - `slide`: `width` and `height` of the slides (default 28 × 15.75, i.e. 16:9). For 4:3, use for instance 28 × 21 and adapt `content`.
-- `content`: the area that receives the content of the slides, below the title: `x`, `y`, `width`, `height`, and the vertical `gap` between two blocks.
+- `content`: the area that receives the content of the slides, below the title: `x`, `y`, `width`, `height`, and the vertical `gap` between two blocks. `align` places the content vertically in this area: `"top"` (default) or `"center"`. With `"center"`, a slide holding only a few bullets has them in the middle of the slide instead of at the top (a wide image under the text still fills the remaining height).
 
 The title, the breadcrumb and the decorations of the master pages have fixed positions (title at 0.95 cm from the top, line at 2.7 cm), section slides assume a slide about 28 cm wide, and the slide background is always white (change it in LibreOffice with _Slide › Slide Properties › Background_ on each master slide).
 
@@ -145,12 +172,40 @@ The title, the breadcrumb and the decorations of the master pages have fixed pos
 
 Options for `@graph` diagrams.
 
-- `connector`: shape of the edges, `"curve"` (default), `"line"` (straight), `"standard"` (right angles) or `"lines"` (several straight segments).
-- `maxScale`: maximum enlargement of a diagram relative to its Graphviz size (default 1.5). Small diagrams are not blown up, since the text would keep its size while the shapes grow.
+- `maxScale`: maximum enlargement of a diagram relative to its Graphviz size (default 1.5). Small diagrams are not blown up, so their text does not become huge.
+- `dpi`: resolution of the PNG rendered by Graphviz (default 300). Do not set `dpi` in the `.dot` file: the size of the diagram on the slide is computed from this one.
+
+#### `theme.images`
+
+Every embedded image is stored as WebP.
+
+- `quality`: WebP quality, from 0 to 100 (default 70).
+- `maxSize`: longest side in pixels (default 3840): larger images are shrunk. SVG images are rasterized at this size.
+
+A WebP image already within `maxSize` is embedded as is, so it does not lose quality twice.
+
+#### `theme.backgrounds`
+
+An image for each master page (`Master` for content slides, `Section` for section slides), drawn above the background color and below the decorations and the text.
+
+- `image`: path relative to the markdown file, `""` (default) for no image.
+- `fit`: `"stretch"` (default) fills the area, `"contain"` keeps the aspect ratio and centers the image in the area.
+- `x`, `y`, `width`, `height`: the area in centimeters (default: the whole slide).
+
+The look of the image comes from the `Master-image` and `Section-image` styles: `draw:image-opacity`, `draw:color-mode` (`standard`, `greyscale`, `mono` or `watermark`), `draw:luminance`, `draw:contrast`, `draw:gamma`, `draw:red`, `draw:green`, `draw:blue`...
+
+```json
+{
+    "theme": { "backgrounds": { "Section": { "image": "images/city.jpg" } } },
+    "styles": { "Section-image": { "graphic": { "draw:image-opacity": "25%", "draw:color-mode": "greyscale" } } }
+}
+```
+
+LibreOffice ignores image adjustments inherited from a named style, so they are also written to an automatic style on each image: change them in `foo.style.json` rather than in LibreOffice's Styles sidebar.
 
 ### Placeholders
 
-Any string value of `styles`, `spanStyles`, `markers`, `dashes` or `bullets` can reference the theme with `{path}`, where `path` is a dot-separated path in `theme` (array indexes are numbers):
+Any string value of `styles`, `spanStyles`, `markers`, `dashes`, `bullets` or `numbers` can reference the theme with `{path}`, where `path` is a dot-separated path in `theme` (array indexes are numbers):
 
 ```json
 "fo:color": "{colors.primary}"
@@ -184,6 +239,7 @@ Each entry of `styles` is one named style:
 | `paragraph` | Properties of the paragraphs: alignment, margins, line height… |
 | `text` | Properties of the characters: font, size, weight, style, color… |
 | `bullets` | Bullets of lists (only for styles that hold lists, see below). |
+| `numbers` | Numbers of numbered lists (only for styles that hold lists, see below). |
 
 Since styles inherit from each other, changing a parent changes all its children. For instance every drawing style derives from `standard`, and `Code` derives from `Prompt`.
 
@@ -203,6 +259,7 @@ Since styles inherit from each other, changing a parent changes all its children
 | `Image` | Frame of images. |
 | `Tableau-cadre` | Frame around tables. |
 | `Decor` | Vertical bar on the left of the slide. |
+| `Master-image` | Background image (`theme.backgrounds.Master`). |
 | `Decor-ligne` | Line under the title. |
 | `Master-notes` | Speaker notes. |
 
@@ -210,9 +267,10 @@ Since styles inherit from each other, changing a parent changes all its children
 
 | Style | Element |
 | --- | --- |
-| `Section-title` | Title. |
-| `Section-subtitle` | Breadcrumb under the title. |
+| `Section-title` | Title: always the `#` heading. |
+| `Section-subtitle` | Breadcrumb of the deeper headings, under the title. |
 | `Section-fond` | Full-slide background rectangle. |
+| `Section-image` | Background image (`theme.backgrounds.Section`), above `Section-fond`. |
 | `Decor` | Horizontal bar under the title. |
 | `Section-notes` | Speaker notes. |
 
@@ -233,19 +291,6 @@ Cell borders are a `paragraph` property (`fo:border`) and padding a `graphic` pr
 
 **`@layout grid`:** `Grille-titre` and `Grille-texte` hold the common properties; `Grille-titre-1…4` and `Grille-texte-1…4` only add the colors of each cell, taken from `theme.colors.grid`.
 
-**`@graph` diagrams:**
-
-| Style | Element |
-| --- | --- |
-| `Graphe-noeud` | Nodes. |
-| `Graphe-texte` | Nodes without border (`shape=plaintext`, `none`, `plain`, `underline` or `style=invis`). |
-| `Graphe-titre` | Label of the graph (`graph [label="…"]`). |
-| `Graphe-groupe` | Clusters (`subgraph cluster_…`). |
-| `Graphe-lien` | Directed edges (arrow at the end). |
-| `Graphe-lien-simple` | Edges without arrow (undirected graphs, `dir=none`). |
-| `Graphe-lien-double` | Edges with `dir=both`. |
-
-Colors and font sizes set in the `.dot` file (`color`, `fillcolor`, `fontcolor`, `fontsize`, `style=filled`, `style=dashed`…) win over the styles: they become automatic styles derived from the named ones.
 
 #### Common properties
 
@@ -306,6 +351,30 @@ Styles that hold lists (`Master-outline1`, `Colonne-texte`, `Grille-texte`) have
 - `size`: size of the bullet relative to the text.
 
 Nested list items use the level of `chars` matching their depth: `Master-outline2…9` do not need a `bullets` entry of their own.
+
+#### Numbers
+
+The same styles have a `numbers` entry, used by numbered lists (`1. item`):
+
+```json
+"numbers": {
+    "formats": ["1", "a", "i", "1", "a", "i", "1", "a", "i"],
+    "suffix": ".",
+    "color": "{colors.accent}",
+    "size": "100%",
+    "weight": "bold",
+    "indent": 0.9,
+    "width": 0.9
+}
+```
+
+- `formats`: numbering of each level, from 1 to 9: `"1"` (1, 2, 3…), `"a"` / `"A"` (letters), `"i"` / `"I"` (roman numerals).
+- `suffix`: text after the number. It applies to every item, so `1)` in the markdown is shown as `1.` with the default suffix.
+- `color`, `size`, `weight` (`"bold"` or `"normal"`): look of the numbers.
+- `indent`: indentation added at each level, in cm.
+- `width`: room left for the number before the text, in cm.
+
+A list holding numbered items is written with two named list styles, `<style>-numbers` and `<style>-bullets` (e.g. `Master-outline1-numbers`), built from `numbers` and `bullets`, so bullets nested in a numbered list (and the reverse) keep their own look. Lists with bullets only keep using the bullets of the frame style. Styles that only inherit lists (`Grille-texte-1…4`) use the entries of their parent.
 
 ### Table templates
 
@@ -384,4 +453,4 @@ npm run build   # transpile src/*.ts into dist/
 npm run pub     # build and publish to npmjs
 ```
 
-Requires Node.js 20.15 or later. Graphviz is bundled as WebAssembly (`@hpcc-js/wasm-graphviz`): nothing else to install.
+Requires Node.js 20.15 or later. Images are converted with [sharp](https://sharp.pixelplumbing.com/), installed by npm with prebuilt binaries.
