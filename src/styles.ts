@@ -79,6 +79,7 @@ export const defaultTheme = {
         ink: "#222222",
         muted: "#7A8899",
         subtitle: "#FFD8B0",
+        sectionHighlight: "#FF9F43",
         white: "#FFFFFF",
         quoteBackground: "#F1F4F8",
         promptBackground: "#DCEBFF",
@@ -204,7 +205,18 @@ function masterStyles(master: "Master" | "Section"): Record<string, StyleDef> {
         },
         [`${master}-subtitle`]: {
             family: "presentation",
-            graphic: { "draw:stroke": "none", "draw:fill": "none", "draw:textarea-vertical-align": "top", ...shrink },
+            graphic: {
+                "draw:stroke": "none",
+                "draw:fill": "solid",
+                "draw:fill-color": "#000000",
+                "draw:opacity": "55%",
+                "draw:textarea-vertical-align": "middle",
+                "fo:padding-left": "0.8cm",
+                "fo:padding-right": "0.8cm",
+                ...shrink,
+            },
+            // Bullets of the hierarchy box of section slides.
+            bullets: { ...bullets, color: "{colors.sectionHighlight}", indent: 1.2 },
             paragraph: { "fo:text-align": "center" },
             text: { ...sans, "fo:font-size": "{sizes.subtitle}pt", "fo:color": "{colors.subtitle}" },
         },
@@ -380,6 +392,12 @@ const defaultStyles: Record<string, StyleDef> = {
         text: { ...mono, "fo:font-size": "{sizes.code}pt", "fo:color": "{colors.ink}" },
     },
     Image: { family: "graphic", parent: "standard", graphic: { "draw:stroke": "none", "draw:fill": "none" } },
+    /** `----`: horizontal rule. */
+    Separateur: {
+        family: "graphic",
+        parent: "standard",
+        graphic: { "draw:stroke": "solid", "svg:stroke-color": "{colors.muted}", "svg:stroke-width": "0.03cm" },
+    },
     "Tableau-cadre": { family: "graphic", parent: "standard", graphic: { "draw:stroke": "none", "draw:fill": "none" } },
     /** `@layout columns ...`: column headings and column text. */
     "Colonne-titre": {
@@ -466,5 +484,7 @@ export const defaultStyle: StyleConfig = {
         T_i: { "fo:font-style": "italic" },
         T_bi: { "fo:font-weight": "bold", "fo:font-style": "italic" },
         T_code: mono,
+        /** Highlighted section in the hierarchy box of a section slide. */
+        T_section: { "fo:font-weight": "bold", "fo:color": "{colors.sectionHighlight}" },
     },
 }

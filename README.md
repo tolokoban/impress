@@ -29,7 +29,9 @@ In a terminal, the output is colored: file names in bold, the example of AI prom
 ## Slides
 
 - `#` headings become section slides (blue background).
-- Deeper headings become content slides, split over several slides when they are too long. A deeper heading with no content of its own, only sub-headings, gets a section slide too: its big title is still the `#` heading above it, and the deeper heading goes in the subtitle (e.g. `Possibilités`).
+- Deeper headings become content slides, split over several slides when they are too long. A deeper heading with no content of its own, only sub-headings, gets a section slide too.
+- A section slide shows the `#` heading as its title, at the top, and below it a box with the hierarchy of the sections under that `#` heading, as nested bullet points. A section is expanded (its sub-sections are listed) only if the slide after the section slide is inside it. The section the slide introduces is highlighted (bold, color `sectionHighlight`); on the slide of a `#` heading, it is the sub-section holding the next slide.
+- When the slides go back up more than one heading level, a section slide recalls where we are before the next slides. From `1 > 1 > 1`, going to `1 > 2` or to `1 > 2 > 1` shows the section slide of `1 > 2`; going to `1 > 1 > 2` does not.
 - Paragraphs, lists, tables, blockquotes and images are laid out automatically: images go beside or below the text depending on their shape.
 - A table too long for one slide is first spread over two side-by-side tables on the same slide. If that is still too long, it is split over several slides. In both cases the header row is repeated on each part, and every part keeps the same column widths. Put `@compact` before the table to shrink it onto one slide instead (see [Pragmas](#pragmas)).
 - Table cells can hold images, as HTML (`<img src="logos/claude.webp" alt="Claude" width="48" height="48">`) or markdown (`![Claude](logos/claude.webp)`). Their pixel sizes assume a 16px font: a 48px image is 3 times as tall as the text of the table, and it shrinks with the text of a `@compact` table. With only `width` or `height`, the other one follows the shape of the image; with neither, the image is 2 lines tall. An image alone in its cell is centered, otherwise it comes before the text. Images too wide for their column are shrunk to fit.
@@ -37,6 +39,7 @@ In a terminal, the output is colored: file names in bold, the example of AI prom
 - Lists can be bulleted (`- item`, `* item`) or numbered (`1. item`, `1) item`), and the two can be nested in each other. A numbered list starts at the number of its first item (`4.` starts at 4); the number of each following item is computed, not read. Numbered items get numbers `1.`, then letters `a.` and roman numerals `i.` when nested (see [Numbers](#numbers)).
 - Blockquotes (`> ...`) are shown in a bordered box with a soft blurred shadow.
 - A code block whose language is `prompt` is shown as a chat bubble.
+- A line of dashes (`----`, at least three) draws a horizontal rule across the content of the slide (style `Separateur`).
 
 ## Pragmas
 
@@ -97,8 +100,9 @@ The theme gathers the values that are used in several places. Changing it is the
 | `primary` | `#1F3A5F` | Slide titles, section background, table headers, quote text and border, diagram node borders. |
 | `accent` | `#E8833A` | Left bar of content slides, line under section titles, bullets. |
 | `ink` | `#222222` | Body text, code, diagram edges. |
-| `muted` | `#7A8899` | Breadcrumb, prompt shadow, diagram clusters. |
-| `subtitle` | `#FFD8B0` | Breadcrumb shown under the title of a section slide. |
+| `muted` | `#7A8899` | Breadcrumb, prompt shadow, diagram clusters, horizontal rules. |
+| `subtitle` | `#FFD8B0` | Sections in the hierarchy box of a section slide. |
+| `sectionHighlight` | `#FF9F43` | Highlighted section in the hierarchy box of a section slide (`T_section`). |
 | `white` | `#FFFFFF` | Section titles, table header text, table cells. |
 | `quoteBackground` | `#F1F4F8` | Blockquotes. |
 | `promptBackground` | `#DCEBFF` | ` ```prompt ` chat bubbles. |
@@ -142,7 +146,7 @@ Font sizes, in points. They are not only applied to the text: they are also used
 | --- | --- | --- |
 | `title` | 34 | Title of content slides. |
 | `sectionTitle` | 44 | Title of section slides (`#` headings). |
-| `subtitle` | 20 | Breadcrumb under a section title. |
+| `subtitle` | 20 | Hierarchy box of section slides. |
 | `breadcrumb` | 14 | Breadcrumb above the title of content slides. |
 | `text` | 24 | Paragraphs. |
 | `list` | `[24, 21, 18, …]` | List items, one size per level (9 levels). |
@@ -257,6 +261,7 @@ Since styles inherit from each other, changing a parent changes all its children
 | `Prompt` | ` ```prompt ` code blocks (chat bubbles). |
 | `Code` | Other code blocks. |
 | `Image` | Frame of images. |
+| `Separateur` | Horizontal rules (`----`). |
 | `Tableau-cadre` | Frame around tables. |
 | `Decor` | Vertical bar on the left of the slide. |
 | `Master-image` | Background image (`theme.backgrounds.Master`). |
@@ -268,7 +273,7 @@ Since styles inherit from each other, changing a parent changes all its children
 | Style | Element |
 | --- | --- |
 | `Section-title` | Title: always the `#` heading. |
-| `Section-subtitle` | Breadcrumb of the deeper headings, under the title. |
+| `Section-subtitle` | Box of the hierarchy of the sections, under the title (semi-transparent background). The sections are a bulleted list, always left aligned, nested by depth; its `bullets` define the bullets (color `sectionHighlight` by default). |
 | `Section-fond` | Full-slide background rectangle. |
 | `Section-image` | Background image (`theme.backgrounds.Section`), above `Section-fond`. |
 | `Decor` | Horizontal bar under the title. |
@@ -396,6 +401,7 @@ Impress has no character styles, so inline formatting is defined in `spanStyles`
 | `T_i` | `*italic*` |
 | `T_bi` | `***bold italic***` |
 | `T_code` | `` `code` `` |
+| `T_section` | Highlighted section in the hierarchy box of a section slide. |
 
 For instance, to show inline code in color on a light background:
 

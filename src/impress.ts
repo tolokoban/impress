@@ -133,6 +133,8 @@ type Block =
     | TableBlock
     | { t: "image"; alt: string; src: string }
     | { t: "note"; text: string }
+    /** `----`: a horizontal rule across the content. */
+    | { t: "hr" }
     | { t: "layout"; layout: Layout; cells: Section[] }
 
 type TableBlock = {
@@ -251,6 +253,8 @@ function stripMd(s: string): string {
 const LIST_RE = /^(\s*)(?:[*-]|(\d+)[.)])\s+(.*)$/
 const IMG_RE = /^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$/
 const HEAD_RE = /^(#{1,6})\s+(.*)$/
+/** Horizontal rule: a line of at least three dashes. */
+const HR_RE = /^-{3,}$/
 
 function parse(md: string, file: string): Section {
     const root = new Section(0, "", null, dirname(file))
@@ -408,6 +412,9 @@ function parse(md: string, file: string): Section {
             for (; i < lines.length && lines[i].trim().startsWith(">"); i++) buf.push(lines[i].trim().slice(1).trim())
             i--
             push({ t: "quote", text: buf.join(" ") })
+        } else if (HR_RE.test(s)) {
+            flush()
+            push({ t: "hr" })
         } else if ((m = line.match(IMG_RE))) {
             flush()
             push({ t: "image", alt: m[1], src: m[2] })
@@ -727,6 +734,9 @@ function tableBlockH(b: TableBlock, width: number): number {
     return Math.max(...tableParts(b).map(rows => tableH(b.header, rows, pw, b.pt ?? sizes.table, cols)))
 }
 
+/** Height taken by a horizontal rule (the line is drawn in its middle). */
+const HR_H = 0.5
+
 function blockH(b: Block, width: number): number {
     switch (b.t) {
         case "para":
@@ -740,6 +750,8 @@ function blockH(b: Block, width: number): number {
             return promptSize(b.lines, width)[1]
         case "table":
             return tableBlockH(b, width)
+        case "hr":
+            return HR_H
         default:
             return 0
     }
@@ -1056,7 +1068,18 @@ async function encodePictures(pics: Picture[]) {
     )
 }
 
-type Page = { master: string; shapes: string[]; notes: string[] }
+type Page = {
+    master: string
+    shapes: string[]
+    notes: string[]
+    /** Section the slide belongs to. */
+    sec: Section | null
+    /** Section slide whose hierarchy box is added once the next slide is known (see `Builder.finish()`). */
+    toc?: Section
+}
+
+/** Geometry of section slides: title at the top, bar under it, then the box of the hierarchy. */
+const SEC = { x: 2, w: 24, titleY: 0.5, titleH: 2.6, barY: 3.1, boxY: 3.7, boxBottom: 15 }
 
 const f2 = (n: number) => n.toFixed(2)
 
@@ -1085,6 +1108,10 @@ class Builder {
     paraStyles = new Map<string, string>()
     /** Hints waiting to be attached to the next slide title. */
     pendingHints: string[] = []
+    /** Heading path of the section of the last slide. */
+    lastPath: string[] = []
+    /** Section of the slides being built. */
+    current: Section | null = null
 
     constructor(base: string) {
         this.base = base
@@ -1259,6 +1286,12 @@ class Builder {
         )
     }
 
+    /** Horizontal line across the box, in its middle. */
+    hrXml(x: number, y: number, w: number, h: number): string {
+        const ly = f2(y + h / 2)
+        return `<draw:line draw:style-name="Separateur" svg:x1="${f2(x)}cm" svg:y1="${ly}cm" svg:x2="${f2(x + w)}cm" svg:y2="${ly}cm"/>`
+    }
+
     promptXml(lines: string[], x: number, y: number, w: number, h: number, style = "Prompt"): string {
         const paras = lines.map(l => `<text:p>${xmlText(l)}</text:p>`).join("")
         return (
@@ -1290,6 +1323,8 @@ class Builder {
                     )
                     .join("")
             }
+            case "hr":
+                return this.hrXml(x, y, w, h)
             default:
                 throw new Error(`Unexpected block ${b.t}`)
         }
@@ -1462,8 +1497,10 @@ class Builder {
     }
 
     // -- pages
-    page(master: string, shapes: string[], notes: string[] = []) {
-        this.pages.push({ master, shapes, notes })
+    page(master: string, shapes: string[], notes: string[] = []): Page {
+        const page: Page = { master, shapes, notes, sec: this.current }
+        this.pages.push(page)
+        return page
     }
 
     titleShapes(title: string, crumbs: string[]): string[] {
@@ -1474,13 +1511,68 @@ class Builder {
     }
 
     sectionPage(sec: Section) {
-        // The big title is always the top-level (`#`) heading; deeper headings go in the subtitle.
-        const [title, ...rest] = sec.path()
-        const shapes = [this.frame("Section-title", 2, 5, 24, 3.5, `<text:p>${xmlText(title)}</text:p>`, "title", this.takeHints())]
-        if (rest.length)
-            shapes.push(this.frame("Section-subtitle", 2, 8.8, 24, 1.5, `<text:p>${xmlText(rest.join(" › "))}</text:p>`, "subtitle"))
+        // The big title is always the top-level (`#`) heading; the hierarchy box comes in `finish()`.
+        const [title] = sec.path()
+        const shapes = [this.frame("Section-title", SEC.x, SEC.titleY, SEC.w, SEC.titleH, `<text:p>${xmlText(title)}</text:p>`, "title", this.takeHints())]
         const notes = sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : []))
-        this.page("Section", shapes, notes)
+        this.page("Section", shapes, notes).toc = sec
+        this.lastPath = sec.path()
+    }
+
+    /** Adds the hierarchy boxes to the section slides, now that the slide after each one is known. */
+    finish() {
+        this.pages.forEach((page, i) => {
+            if (page.toc) page.shapes.push(...this.tocShapes(page.toc, this.pages[i + 1]?.sec ?? null))
+        })
+    }
+
+    /**
+     * Box listing the sub-sections of the `#` heading of `sec`, indented by depth. A section is
+     * expanded only if the next slide (in section `next`) is inside it. The highlighted section is
+     * `sec`, or for a `#` slide, the sub-section holding the next slide.
+     */
+    tocShapes(sec: Section, next: Section | null): string[] {
+        let top: Section = sec
+        while (top.parent && top.parent.level > 0) top = top.parent
+        const ancestors = new Set<Section>()
+        for (let s = next?.parent ?? null; s; s = s.parent) ancestors.add(s)
+        let current: Section | null = sec.level > 1 ? sec : null
+        if (!current && next && next !== top) {
+            current = next
+            while (current.parent && current.parent !== top) current = current.parent
+        }
+        const pt = style.theme.sizes.subtitle
+        const lines: string[] = []
+        // Nested bulleted lists: the bullets come from the `bullets` of `Section-subtitle` (list style `Toc-list`).
+        const listXml = (parent: Section): string => {
+            const items: string[] = []
+            for (const child of parent.children) {
+                if (child.continued || !child.title) continue
+                let text = xmlText(child.title)
+                if (child === current) text = `<text:span text:style-name="T_section">${text}</text:span>`
+                lines.push(text)
+                const sub = ancestors.has(child) ? listXml(child) : ""
+                items.push(`<text:list-item><text:p text:style-name="Toc">${text}</text:p>${sub}</text:list-item>`)
+            }
+            const name = style.styles["Section-subtitle"]?.bullets ? ` text:style-name="Toc-list"` : ""
+            return items.length ? `<text:list${name}>${items.join("")}</text:list>` : ""
+        }
+        const xml = listXml(top)
+        if (!lines.length) return []
+        const lineH = pt * PT * 1.25
+        const h = Math.min(SEC.boxBottom - SEC.boxY, lines.length * lineH + 1.2)
+        return [this.frame("Section-subtitle", SEC.x, SEC.boxY, SEC.w, h, xml, "subtitle")]
+    }
+
+    /**
+     * When going back up more than one level (from `1 > 1 > 1` to `1 > 2`, or to `1 > 2 > 1`),
+     * a section slide recalls where we are before the slides of `sec`.
+     */
+    recallSection(sec: Section) {
+        const path = sec.path()
+        let common = 0
+        while (common < path.length && common < this.lastPath.length && path[common] === this.lastPath[common]) common++
+        if (this.lastPath.length - common >= 2) this.sectionPage(sec)
     }
 
     contentPages(title: string, crumbs: string[], blocks: Block[]) {
@@ -1563,6 +1655,7 @@ class Builder {
             const b = it.block
             if (b.t === "table") return tableH(b.header, b.rows, w, sizes.tableSmall)
             if (b.t === "prompt" || b.t === "code") return promptSize(b.lines, w)[1]
+            if (b.t === "hr") return HR_H
             return 0
         })
         const flexible = items.map(it => it.kind === "text" || (it.kind === "block" && it.block.t === "image"))
@@ -1606,6 +1699,8 @@ class Builder {
                 } else if (b.t === "prompt" || b.t === "code") {
                     const [pw] = promptSize(b.lines, w)
                     shapes.push(this.promptXml(b.lines, x + w - pw, cy, pw, ih, b.t === "prompt" ? "Prompt" : "Code"))
+                } else if (b.t === "hr") {
+                    shapes.push(this.hrXml(x, cy, w, ih))
                 }
             }
             cy += heights[i] + gap
@@ -1672,6 +1767,7 @@ class Builder {
     }
 
     walk(sec: Section) {
+        this.current = sec
         this.pendingHints.push(...sec.hints)
         const crumbs = sec.path().slice(0, -1)
         const content = sec.blocks.filter(b => b.t !== "note")
@@ -1680,8 +1776,11 @@ class Builder {
         if (sec.level === 1 && !sec.continued) {
             this.sectionPage(sec)
             if (content.length) this.contentPages(sec.title, [...crumbs, sec.title], sec.blocks)
+            this.lastPath = sec.path()
         } else if (content.length) {
+            this.recallSection(sec)
             this.contentPages(sec.title, crumbs, sec.blocks)
+            this.lastPath = sec.path()
         } else if (sec.children.length && !groupedOnly) {
             this.sectionPage(sec)
         }
@@ -1698,11 +1797,17 @@ class Builder {
                 continue
             }
             const group = children.slice(i, i + cellCount(layout))
+            if (sec.level > 0) this.recallSection(sec)
+            this.current = group[0]
             for (const g of group) this.pendingHints.push(...g.hints)
             const title = sec.level > 0 ? sec.title : group[0].title
             this.layoutPage(title, sec.path().slice(0, -1), group, layout, i === 0 ? notes : [])
+            this.lastPath = sec.level > 0 ? sec.path() : group[0].path()
             // Sub-sections of grouped sections still get their own slides.
-            for (const g of group) this.walkChildren(g)
+            for (const g of group) {
+                this.current = g
+                this.walkChildren(g)
+            }
             i += group.length - 1
         }
     }
@@ -1864,9 +1969,9 @@ function stylesXml(b: Builder): string {
         `<style:master-page style:name="Section" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
             `<draw:rect draw:style-name="Section-fond" ${Builder.geom(0, 0, SLIDE_W, SLIDE_H)}/>` +
             backgroundXml(b, "Section") +
-            `<draw:rect draw:style-name="Decor" ${Builder.geom(0, 8.55, SLIDE_W, 0.12)}/>` +
-            placeholder("Section-title", "title", 2, 5, 24, 3.5) +
-            placeholder("Section-subtitle", "subtitle", 2, 8.8, 24, 1.5) +
+            `<draw:rect draw:style-name="Decor" ${Builder.geom(0, SEC.barY, SLIDE_W, 0.12)}/>` +
+            placeholder("Section-title", "title", SEC.x, SEC.titleY, SEC.w, SEC.titleH) +
+            placeholder("Section-subtitle", "subtitle", SEC.x, SEC.boxY, SEC.w, SEC.boxBottom - SEC.boxY) +
             `${notes("Section")}</style:master-page>`,
     ]
     return (
@@ -1891,6 +1996,12 @@ function contentXml(b: Builder): string {
         const para = indent ? `<style:paragraph-properties fo:margin-left="${indent}cm"/>` : ""
         auto.push(`<style:style style:name="${name}" style:family="paragraph">${para}<style:text-properties fo:font-size="${pt}pt"/></style:style>`)
     }
+    // Lines of the hierarchy boxes of section slides: left aligned (the bullets indent them).
+    auto.push(
+        `<style:style style:name="Toc" style:family="paragraph"><style:paragraph-properties fo:text-align="start" fo:margin-top="0.1cm" fo:margin-bottom="0.1cm"/></style:style>`,
+    )
+    const tocBullets = style.styles["Section-subtitle"]?.bullets
+    if (tocBullets) auto.push(bulletsXml(tocBullets, "Toc"))
     for (const [key, name] of b.rowStyles)
         auto.push(`<style:style style:name="${name}" style:family="table-row"><style:table-row-properties style:row-height="${key}cm"/></style:style>`)
     const pages = b.pages.map(({ master, shapes, notes }, i) => {
@@ -2014,6 +2125,7 @@ async function convert(src: string, config: StyleConfig): Promise<{ out: string;
     const root = parse(readFileSync(src, "utf8"), src)
     const b = new Builder(dirname(src))
     b.walkChildren(root)
+    b.finish()
     const out = src.replace(/\.md$/i, ".odp")
     await writeOdp(b, out, basename(src, extname(src)))
     return { out, hints: countHints(root) }
