@@ -25,6 +25,8 @@
  * Every embedded image (graphs included) is stored as WebP (see `theme.images`).
  *   @next                   start a new slide with the same title as the current one
  *   @compact                the next table is shrunk to fit on one slide instead of being split
+ *   @compact N { ... @}     the blocks in between are compacted on one slide, in N columns (1 by
+ *                           default, "*" for the number giving the biggest text), shrunk if needed
  *   @reveal C1,3 R1-4       the rows of the next table appear one slide after the other; the
  *                           columns (C) and rows (R) listed, both optional, are always visible
  *   ```prompt ... ```       chat prompt bubble
@@ -126,16 +128,37 @@ function resolveValue(value: string, where: string): string {
 type ListItem = [number, string, number?]
 
 type Block =
-    | { t: "para"; text: string }
-    | { t: "list"; items: ListItem[] }
-    | { t: "quote"; text: string }
-    | { t: "prompt" | "code"; lines: string[] }
+    | ({ t: "para"; text: string } & Scaled)
+    | ({ t: "list"; items: ListItem[] } & Scaled)
+    | ({ t: "quote"; text: string } & Scaled)
+    | ({ t: "prompt" | "code"; lines: string[] } & Scaled)
     | TableBlock
-    | { t: "image"; alt: string; src: string }
+    | ({ t: "image"; alt: string; src: string } & Scaled)
     | { t: "note"; text: string }
     /** `----`: a horizontal rule across the content. */
     | { t: "hr" }
     | { t: "layout"; layout: Layout; cells: Section[] }
+    | CompactBlock
+
+/** Font scale of a block of a `@compact {` region (1 when undefined). */
+type Scaled = { k?: number }
+
+/**
+ * `@compact N { ... @}`: blocks compacted on one slide, flowing through `columns` columns.
+ * `n` and `k` (number of columns and scale) are chosen by `Builder.compactRegion()`.
+ */
+type CompactBlock = {
+    t: "compact"
+    /** Number of columns asked, or "auto" for `@compact * {`. */
+    columns: number | "auto"
+    blocks: Block[]
+    /** `file:line` of the `@compact {`, for the messages. */
+    where: string
+    n?: number
+    k?: number
+    /** Rows of its `@reveal` tables revealed on the current slide (all of them when undefined). */
+    shown?: Set<string[]>
+}
 
 type TableBlock = {
     t: "table"
@@ -255,6 +278,8 @@ const IMG_RE = /^\s*!\[([^\]]*)\]\(([^)]+)\)\s*$/
 const HEAD_RE = /^(#{1,6})\s+(.*)$/
 /** Horizontal rule: a line of at least three dashes. */
 const HR_RE = /^-{3,}$/
+/** `@compact {`, `@compact 3 {` or `@compact * {`. */
+const COMPACT_RE = /^@compact\s*(\d+|\*)?\s*\{$/
 
 function parse(md: string, file: string): Section {
     const root = new Section(0, "", null, dirname(file))
@@ -262,6 +287,8 @@ function parse(md: string, file: string): Section {
     const lines = md.split("\n")
     let para: string[] = []
     let list: { t: "list"; items: ListItem[] } | null = null
+    // Open `@compact {` region: its blocks go into it until `@}`.
+    let region: CompactBlock | null = null
     let layout: Layout | null = null
     // `@layout` followed by content instead of a heading: the next blocks fill its cells.
     let grouped: { t: "layout"; layout: Layout; cells: Section[] } | null = null
@@ -279,6 +306,7 @@ function parse(md: string, file: string): Section {
     }
 
     const push = (b: Block) => {
+        if (region) return void region.blocks.push(b)
         if (!grouped) return void cur.blocks.push(b)
         const cells = grouped.cells
         if (b.t === "note") return void (cells.length ? cells[cells.length - 1].blocks : cur.blocks).push(b)
@@ -314,6 +342,10 @@ function parse(md: string, file: string): Section {
         const line = lines[i]
         const s = line.trim()
         let m: RegExpMatchArray | null
+        if (region && (HEAD_RE.test(line) || s === "@next" || s.startsWith("@layout"))) {
+            const what = HEAD_RE.test(line) ? "a heading" : s === "@next" ? '"@next"' : '"@layout"'
+            throw new Error(`${file}:${i + 1}: ${what} cannot be inside a "@compact {" region (opened at line ${region.where.split(":").pop()}, closed by "@}")`)
+        }
         if ((m = line.match(HEAD_RE))) {
             flush()
             dropCompact()
@@ -348,6 +380,24 @@ function parse(md: string, file: string): Section {
             sec.continued = true
             cur.parent.children.push(sec)
             cur = sec
+        } else if ((m = s.match(COMPACT_RE))) {
+            const where = `${file}:${i + 1}`
+            if (region) throw new Error(`${where}: "@compact {" regions cannot be nested (one is already open since line ${region.where.split(":").pop()})`)
+            flush()
+            dropCompact()
+            dropReveal()
+            const columns = m[1] === "*" ? "auto" : Number(m[1] ?? 1)
+            if (columns === 0) throw new Error(`${where}: a "@compact {" region needs at least one column`)
+            const b: CompactBlock = { t: "compact", columns, blocks: [], where }
+            push(b)
+            region = b
+        } else if (s === "@}") {
+            if (!region) throw new Error(`${file}:${i + 1}: "@}" without an open "@compact {" region`)
+            flush()
+            dropCompact()
+            dropReveal()
+            if (!region.blocks.some(b => b.t !== "note")) console.warn(`  ! ${bold(region.where)}: empty "@compact {" region`)
+            region = null
         } else if (s === "@compact") {
             flush()
             dropCompact()
@@ -441,6 +491,7 @@ function parse(md: string, file: string): Section {
     flush()
     dropCompact()
     dropReveal()
+    if (region) throw new Error(`${(region as CompactBlock).where}: "@compact {" region not closed by "@}"`)
     if (layout) console.warn(`  ! ${bold(file)}: "${(layout as Layout).source}" is not followed by any section`)
     return root
 }
@@ -534,18 +585,18 @@ function textH(nChars: number, width: number, pt: number, lh = 1.25): number {
     return Math.max(1, Math.ceil(nChars / cpl)) * pt * PT * lh
 }
 
-function paraH(text: string, width: number, pt = sizes.text): number {
-    return text.split("\n").reduce((h, p) => h + textH(plainLen(p), width, pt), 0) + 0.25
+function paraH(text: string, width: number, pt = sizes.text, k = 1): number {
+    return text.split("\n").reduce((h, p) => h + textH(plainLen(p), width, pt), 0) + 0.25 * k
 }
 
-function listH(items: ListItem[], width: number): number {
+function listH(items: ListItem[], width: number, k = 1): number {
     let h = 0
-    for (const [lvl, txt] of items) h += textH(plainLen(txt), width - 0.9 * (lvl + 1), sizes.list[Math.min(lvl, 8)]) + 0.3
+    for (const [lvl, txt] of items) h += textH(plainLen(txt), width - 0.9 * (lvl + 1), sizes.list[Math.min(lvl, 8)] * k) + 0.3 * k
     return h + 0.1
 }
 
-function promptSize(lines: string[], width: number): [number, number] {
-    const pt = sizes.prompt
+function promptSize(lines: string[], width: number, k = 1): [number, number] {
+    const pt = sizes.prompt * k
     const longest = Math.max(10, ...lines.map(l => l.length))
     const w = Math.min(width, Math.max(8, longest * pt * PT * 0.5 + 1.4))
     const h = lines.reduce((acc, l) => acc + textH(l.length, w - 1, pt), 0) + 0.9
@@ -657,10 +708,10 @@ function boldWordW(word: string, pt: number): number {
  * Do the words of the header of a `@compact` or `@reveal` table fit in their columns, at the
  * size of the table, on a slide of full width? Several words may wrap, but no word is cut.
  */
-function headerFits(b: TableBlock): boolean {
+function headerFits(b: TableBlock, width = W): boolean {
     if (!b.header) return true
     const pt = b.pt ?? sizes.table
-    const cols = tableBlockCols(b, W)
+    const cols = tableBlockCols(b, width)
     return b.header.every((s, i) => {
         const c = cell(s)
         const room = cols[i] - CELL_PAD_X - cellTextIndent(c, cols[i], pt)
@@ -740,18 +791,20 @@ const HR_H = 0.5
 function blockH(b: Block, width: number): number {
     switch (b.t) {
         case "para":
-            return paraH(b.text, width)
+            return paraH(b.text, width, sizes.text * (b.k ?? 1), b.k)
         case "list":
-            return listH(b.items, width)
+            return listH(b.items, width, b.k)
         case "quote":
-            return paraH(b.text, width - 1.2, sizes.quote) + 0.8
+            return paraH(b.text, width - 1.2, sizes.quote * (b.k ?? 1), b.k) + 0.8
         case "prompt":
         case "code":
-            return promptSize(b.lines, width)[1]
+            return promptSize(b.lines, width, b.k)[1]
         case "table":
             return tableBlockH(b, width)
         case "hr":
             return HR_H
+        case "compact":
+            return arrange(b, width).h
         default:
             return 0
     }
@@ -793,6 +846,173 @@ function imageSize(path: string): [number, number] {
 function fit(iw: number, ih: number, bw: number, bh: number): [number, number] {
     const r = Math.min(bw / iw, bh / ih)
     return [iw * r, ih * r]
+}
+
+// ---------------------------------------------------------------- compact regions
+
+/** Lowest font scale of a `@compact {` region: 10pt for a body text of 24pt. */
+const MIN_COMPACT_SCALE = 10 / 24
+/** Highest number of columns tried by `@compact * {`. */
+const MAX_AUTO_COLUMNS = 8
+
+/** Font scales tried for a `@compact {` region, biggest first: the body text loses half a point at each step. */
+function compactScales(): number[] {
+    const out: number[] = []
+    for (let pt = sizes.text; pt >= sizes.text * MIN_COMPACT_SCALE - 1e-6; pt -= 0.5) out.push(pt / sizes.text)
+    return out
+}
+
+/**
+ * What can go to a column of a region on its own: a block, a top-level item of a list (with its
+ * sub-items), or a row of a table. `src` is the block it comes from.
+ */
+type Piece = { src: Block; block: Block }
+
+const piecesCache = new WeakMap<Block[], Piece[]>()
+
+function compactPieces(blocks: Block[]): Piece[] {
+    let out = piecesCache.get(blocks)
+    if (out) return out
+    const pieces: Piece[] = []
+    for (const b of blocks) {
+        if (b.t === "note") continue
+        if (b.t === "list") {
+            let start = 0
+            b.items.forEach((it, i) => {
+                if (i > start && it[0] === 0) {
+                    pieces.push({ src: b, block: { ...b, items: b.items.slice(start, i) } })
+                    start = i
+                }
+            })
+            pieces.push({ src: b, block: { ...b, items: b.items.slice(start) } })
+        } else if (b.t === "table" && b.rows.length > 1) {
+            for (const r of b.rows) pieces.push({ src: b, block: { ...b, rows: [r] } })
+        } else pieces.push({ src: b, block: b })
+    }
+    piecesCache.set(blocks, (out = pieces))
+    return out
+}
+
+/** A block of a region at the font scale `k`. Tables keep the column widths of all their rows. */
+function scaleBlock(b: Block, src: Block, k: number): Block {
+    if (b.t === "table") return { ...b, pt: sizes.table * k, ref: (src as TableBlock).rows, compact: undefined, columns: undefined }
+    if (b.t === "hr" || b.t === "note" || b.t === "layout" || b.t === "compact") return b
+    return { ...b, k }
+}
+
+/** The blocks of a column: consecutive pieces of the same list or table are merged back together. */
+function mergePieces(pieces: Piece[], k: number): Block[] {
+    const out: Block[] = []
+    pieces.forEach((p, i) => {
+        const last = out[out.length - 1]
+        const same = i > 0 && pieces[i - 1].src === p.src
+        if (same && last.t === "list" && p.block.t === "list") out[out.length - 1] = { ...last, items: [...last.items, ...p.block.items] }
+        else if (same && last.t === "table" && p.block.t === "table") out[out.length - 1] = { ...last, rows: [...last.rows, ...p.block.rows] }
+        else out.push(scaleBlock(p.block, p.src, k))
+    })
+    return out
+}
+
+/** Height of a block in a column of a region. An image takes the width of the column, up to the (scaled) height of the slide. */
+function regionBlockH(b: Block, width: number): number {
+    if (b.t !== "image") return blockH(b, width)
+    return regionImageSize(b, width)[1]
+}
+
+function regionImageSize(b: { src: string; k?: number }, width: number): [number, number] {
+    const [iw, ih] = imageSize(resolve(mdDir, b.src))
+    return fit(iw, ih, width, H * (b.k ?? 1))
+}
+
+/** A region laid out in `n` columns of width `colW`, separated by `gap`, at the font scale `k`. */
+type Arrangement = { n: number; k: number; colW: number; gap: number; cols: Block[][]; h: number }
+
+const arrangeCache = new WeakMap<Block[], Map<string, Arrangement>>()
+
+/**
+ * Lay out a region at its scale and number of columns (fewer if it has fewer pieces) in `width`.
+ * The pieces flow in reading order through the columns, cut so that the tallest column is as
+ * short as possible.
+ */
+function arrange(b: CompactBlock, width: number): Arrangement {
+    const k = b.k ?? 1
+    const pieces = compactPieces(b.blocks)
+    const P = pieces.length
+    const n = Math.max(1, Math.min(b.n ?? (b.columns === "auto" ? 1 : b.columns), P))
+    const key = `${f2(width)}|${n}|${k}`
+    let cache = arrangeCache.get(b.blocks)
+    if (!cache) arrangeCache.set(b.blocks, (cache = new Map()))
+    const hit = cache.get(key)
+    if (hit) return hit
+    // 1em of the (scaled) body text between the columns.
+    const gap = sizes.text * k * PT
+    const colW = (width - gap * (n - 1)) / n
+    const memo = new Map<number, number>()
+    /** Height of the column holding the pieces `i` to `j - 1`. */
+    const colH = (i: number, j: number): number => {
+        let h = memo.get(i * (P + 1) + j)
+        if (h === undefined) {
+            const bs = mergePieces(pieces.slice(i, j), k)
+            h = bs.reduce((a, x) => a + regionBlockH(x, colW), 0) + GAP * k * (bs.length - 1)
+            memo.set(i * (P + 1) + j, h)
+        }
+        return h
+    }
+    // best[c][j]: lowest height of the tallest of `c` columns holding the first `j` pieces;
+    // cut[c][j]: first piece of the last of these columns.
+    const best: number[][] = [Array.from({ length: P + 1 }, (_, j) => (j ? Infinity : 0))]
+    const cut: number[][] = [[]]
+    for (let c = 1; c <= n; c++) {
+        best.push(new Array(P + 1).fill(Infinity))
+        cut.push(new Array(P + 1).fill(0))
+        for (let j = c; j <= P; j++)
+            for (let i = c - 1; i < j; i++) {
+                const h = Math.max(best[c - 1][i], colH(i, j))
+                if (h < best[c][j]) {
+                    best[c][j] = h
+                    cut[c][j] = i
+                }
+            }
+    }
+    const cols: Block[][] = []
+    if (P)
+        for (let c = n, j = P; c > 0; c--) {
+            const i = cut[c][j]
+            cols.unshift(mergePieces(pieces.slice(i, j), k))
+            j = i
+        }
+    const out: Arrangement = { n, k, colW, gap, cols, h: P ? best[n][P] : 0 }
+    cache.set(key, out)
+    return out
+}
+
+/**
+ * Do the words of a laid out region fit in its columns? The words of the table headers are always
+ * checked (as for `@compact` tables); those of the paragraphs, quotes and lists only when `all`.
+ */
+function regionWordsFit(arr: Arrangement, all: boolean): boolean {
+    const fits = (text: string, room: number, pt: number) =>
+        inline(text)
+            .map(r => r.text)
+            .join("")
+            .split(/\s+/)
+            .filter(Boolean)
+            .every(w => boldWordW(w, pt) <= room)
+    return arr.cols.every(col =>
+        col.every(b => {
+            if (b.t === "table") return headerFits(b, arr.colW)
+            if (!all) return true
+            if (b.t === "para") return fits(b.text, arr.colW - 0.5, sizes.text * arr.k)
+            if (b.t === "quote") return fits(b.text, arr.colW - 1.7, sizes.quote * arr.k)
+            if (b.t === "list") return b.items.every(([lvl, txt]) => fits(txt, arr.colW - 0.9 * (lvl + 1), sizes.list[Math.min(lvl, 8)] * arr.k))
+            return true
+        }),
+    )
+}
+
+/** The tables of some blocks, including those of their `@compact {` regions. */
+function tablesOf(blocks: Block[]): TableBlock[] {
+    return blocks.flatMap(b => (b.t === "table" ? [b] : b.t === "compact" ? tablesOf(b.blocks) : []))
 }
 
 // ---------------------------------------------------------------- graphviz
@@ -1089,13 +1309,14 @@ const f2 = (n: number) => n.toFixed(2)
  * the order of the slide, rows in reading order). Rows with nothing to reveal are skipped.
  */
 function revealSteps(content: Block[]): Block[][] {
-    const order = content.flatMap(b =>
-        b.t === "table" && b.reveal ? b.rows.filter(r => !b.reveal!.rows.has(r) && r.some((c, i) => c !== "" && !b.reveal!.cols.has(i))) : [],
-    )
-    if (!content.some(b => b.t === "table" && b.reveal)) return [content]
+    const revealed = tablesOf(content).filter(b => b.reveal)
+    if (!revealed.length) return [content]
+    const order = revealed.flatMap(b => b.rows.filter(r => !b.reveal!.rows.has(r) && r.some((c, i) => c !== "" && !b.reveal!.cols.has(i))))
     return Array.from({ length: order.length + 1 }, (_, k) => {
         const shown = new Set(order.slice(0, k))
-        return content.map(b => (b.t === "table" && b.reveal ? { ...b, shown } : b))
+        return content.map(b =>
+            (b.t === "table" && b.reveal) || (b.t === "compact" && tablesOf(b.blocks).some(t => t.reveal)) ? { ...b, shown } : b,
+        )
     })
 }
 
@@ -1144,10 +1365,20 @@ class Builder {
      * Automatic paragraph style setting the font size (in points) of a `@compact` table,
      * and the left margin (in cm) leaving room for the images of a cell.
      */
-    paraStyle(pt: number, indent = 0): string {
-        const key = indent ? `${f2(pt)}/${f2(indent)}` : f2(pt)
+    paraStyle(pt: number, indent = 0, margins?: [number, number]): string {
+        const key = [f2(pt), indent ? f2(indent) : "", margins ? margins.map(f2).join(",") : ""].join("/")
         if (!this.paraStyles.has(key)) this.paraStyles.set(key, `Pt${this.paraStyles.size + 1}`)
         return this.paraStyles.get(key)!
+    }
+
+    /**
+     * Style attribute of a paragraph of `pt` points shrunk by a `@compact {` region (nothing when
+     * `k` is 1). The spacing above and below the paragraphs of the style `name` shrinks too.
+     */
+    scaledPara(pt: number, k = 1, name?: string): string {
+        if (k === 1) return ""
+        const margins = name ? ([styleCm(name, "fo:margin-top") * k, styleCm(name, "fo:margin-bottom") * k] as [number, number]) : undefined
+        return ` text:style-name="${this.paraStyle(pt * k, 0, margins)}"`
     }
 
     rowStyle(h: number): string {
@@ -1181,7 +1412,7 @@ class Builder {
      * style. Lists with numbered items name the list styles `<frameStyle>-numbers` and
      * `<frameStyle>-bullets` (see `listStylesXml()`) on every nested list.
      */
-    listXml(items: ListItem[], frameStyle: string): string {
+    listXml(items: ListItem[], frameStyle: string, k = 1): string {
         const holder = listStyleHolder(frameStyle)
         const styled = holder !== null && items.some(it => it[2] !== undefined)
         const out: string[] = []
@@ -1204,7 +1435,7 @@ class Builder {
                 out.push(`<text:list${name}><text:list-item${start}>`)
                 open.push(ordered)
             }
-            out.push(`<text:p>${runsXml(txt)}</text:p>`)
+            out.push(`<text:p${this.scaledPara(sizes.list[Math.min(lvl, 8)], k, outlineStyle(frameStyle, lvl))}>${runsXml(txt)}</text:p>`)
         }
         while (open.length) close()
         return out.join("")
@@ -1292,8 +1523,9 @@ class Builder {
         return `<draw:line draw:style-name="Separateur" svg:x1="${f2(x)}cm" svg:y1="${ly}cm" svg:x2="${f2(x + w)}cm" svg:y2="${ly}cm"/>`
     }
 
-    promptXml(lines: string[], x: number, y: number, w: number, h: number, style = "Prompt"): string {
-        const paras = lines.map(l => `<text:p>${xmlText(l)}</text:p>`).join("")
+    promptXml(lines: string[], x: number, y: number, w: number, h: number, style = "Prompt", k = 1): string {
+        const ps = this.scaledPara(style === "Code" ? sizes.code : sizes.prompt, k)
+        const paras = lines.map(l => `<text:p${ps}>${xmlText(l)}</text:p>`).join("")
         return (
             `<draw:custom-shape draw:style-name="${style}" ${Builder.geom(x, y, w, h)}>${paras}` +
             `<draw:enhanced-geometry svg:viewBox="0 0 21600 21600" draw:type="round-rectangle" draw:modifiers="1800"/>` +
@@ -1304,16 +1536,18 @@ class Builder {
     blockXml(b: Block, x: number, y: number, w: number, h: number): string {
         switch (b.t) {
             case "para":
-                return this.frame("Texte", x, y, w, h, `<text:p>${runsXml(b.text)}</text:p>`)
+                return this.frame("Texte", x, y, w, h, `<text:p${this.scaledPara(sizes.text, b.k, "Texte")}>${runsXml(b.text)}</text:p>`)
             case "list":
-                return this.frame("Master-outline1", x, y, w, h, this.listXml(b.items, "Master-outline1"), "outline")
+                return this.frame("Master-outline1", x, y, w, h, this.listXml(b.items, "Master-outline1", b.k), "outline")
             case "quote":
-                return this.frame("Citation", x, y, w, h, `<text:p>${runsXml(b.text)}</text:p>`)
+                return this.frame("Citation", x, y, w, h, `<text:p${this.scaledPara(sizes.quote, b.k, "Citation")}>${runsXml(b.text)}</text:p>`)
             case "prompt":
             case "code": {
-                const [pw] = promptSize(b.lines, w)
-                return this.promptXml(b.lines, x + w - pw, y, pw, h, b.t === "prompt" ? "Prompt" : "Code")
+                const [pw] = promptSize(b.lines, w, b.k)
+                return this.promptXml(b.lines, x + w - pw, y, pw, h, b.t === "prompt" ? "Prompt" : "Code", b.k)
             }
+            case "compact":
+                return this.regionXml(b, x, y, w)
             case "table": {
                 const pw = tablePartW(b, w)
                 const cols = tableBlockCols(b, w)
@@ -1328,6 +1562,25 @@ class Builder {
             default:
                 throw new Error(`Unexpected block ${b.t}`)
         }
+    }
+
+    /** The columns of a `@compact {` region, top-aligned. */
+    regionXml(b: CompactBlock, x: number, y: number, w: number): string {
+        const arr = arrange(b, w)
+        const out: string[] = []
+        arr.cols.forEach((col, c) => {
+            const cx = x + c * (arr.colW + arr.gap)
+            let cy = y
+            for (const blk of col) {
+                const bh = regionBlockH(blk, arr.colW)
+                if (blk.t === "image") {
+                    const [iw] = regionImageSize(blk, arr.colW)
+                    out.push(this.imageXml(blk.src, cx + (arr.colW - iw) / 2, cy, iw, bh, blk.alt))
+                } else out.push(this.blockXml(blk.t === "table" && b.shown ? { ...blk, shown: b.shown } : blk, cx, cy, arr.colW, bh))
+                cy += bh + GAP * arr.k
+            }
+        })
+        return out.join("")
     }
 
     // -- slide-level layout
@@ -1380,6 +1633,10 @@ class Builder {
         for (const b of blocks) {
             if (b.t === "note") {
                 slides[slides.length - 1][1].push(b.text)
+                continue
+            }
+            if (b.t === "compact") {
+                this.compactRegion(b, slides)
                 continue
             }
             if (b.t === "table" && (!this.fits([b]) || ((b.compact || b.reveal) && !headerFits(b)))) {
@@ -1449,6 +1706,53 @@ class Builder {
         if (!cur.length || this.fits([...cur, small])) return void cur.push(small)
         const carry = cur.length > 1 && intro.length && this.fits([...intro, small]) ? [cur.pop()!] : []
         slides.push([[...carry, small], []])
+    }
+
+    /**
+     * A `@compact {` region: at full size if it fits on a slide with the paragraph introducing it,
+     * otherwise shrunk (by steps of half a point of body text) until its balanced columns fit.
+     * `@compact * {` takes the number of columns giving the biggest text (the fewest on a tie),
+     * among those where no word is too long for its column. Like a `@compact` table, it stays on
+     * the current slide if it fits there, otherwise it starts a new one with its introduction.
+     */
+    compactRegion(b: CompactBlock, slides: [Block[], string[]][]) {
+        const cur = slides[slides.length - 1][0]
+        const last = cur[cur.length - 1]
+        const intro = last?.t === "para" ? [last] : []
+        const pieces = compactPieces(b.blocks).length
+        const auto = b.columns === "auto"
+        const counts = auto
+            ? Array.from({ length: Math.max(1, Math.min(pieces, MAX_AUTO_COLUMNS)) }, (_, i) => i + 1)
+            : [Math.max(1, Math.min(b.columns as number, pieces))]
+        const scales = compactScales()
+        const at = (n: number, k: number): CompactBlock => ({ ...b, n, k })
+        const fitsAlone = (r: CompactBlock) => this.fits([...intro, r])
+        // Biggest scale (fewest columns on a tie) passing `ok`.
+        const search = (ok: (r: CompactBlock) => boolean): CompactBlock | null => {
+            let found: CompactBlock | null = null
+            for (const n of counts) {
+                const k = scales.find(k => (!found || k > found.k!) && ok(at(n, k)))
+                if (k !== undefined) found = at(n, k)
+                if (found?.k === 1) break
+            }
+            return found
+        }
+        let region = search(r => fitsAlone(r) && regionWordsFit(arrange(r, W), auto)) ?? search(fitsAlone)
+        const minPt = Math.round(sizes.text * MIN_COMPACT_SCALE * 2) / 2
+        if (!region) {
+            // Too long even at the smallest size: the number of columns giving the shortest region.
+            const k = scales[scales.length - 1]
+            region = counts.map(n => at(n, k)).reduce((a, r) => (arrange(r, W).h < arrange(a, W).h ? r : a))
+            console.warn(`  ! ${bold(b.where)}: the "@compact {" region is still too long with a body text of ${minPt}pt: it overflows its slide`)
+        } else if (!regionWordsFit(arrange(region, W), false)) {
+            console.warn(`  ! ${bold(b.where)}: a table of the "@compact {" region has header words too long for their column`)
+        }
+        if (!cur.length || this.fits([...cur, region])) cur.push(region)
+        else {
+            const carry = cur.length > 1 && intro.length && this.fits([...intro, region]) ? [cur.pop()!] : []
+            slides.push([[...carry, region], []])
+        }
+        slides[slides.length - 1][1].push(...b.blocks.flatMap(x => (x.t === "note" ? [x.text] : [])))
     }
 
     /**
@@ -1642,6 +1946,7 @@ class Builder {
         type Item = { kind: "text"; blocks: Block[] } | { kind: "block"; block: Block }
         const items: Item[] = []
         for (const b of sec.blocks) {
+            if (b.t === "compact") throw new Error(`${b.where}: a "@compact {" region cannot be in a cell of an "@layout"`)
             if (b.t === "note" || b.t === "layout") continue
             const last = items[items.length - 1]
             if (b.t === "para" || b.t === "list" || b.t === "quote") {
@@ -1850,6 +2155,25 @@ function bulletsXml(def: BulletDef, name: string): string {
     return `<text:list-style style:name="${esc(name)}-list">${levels.join("")}</text:list-style>`
 }
 
+/** Length in cm of a paragraph property (`"0.2cm"`) of a style or of its parents, 0 if none. */
+function styleCm(name: string, prop: string): number {
+    for (let n: string | undefined = name, depth = 0; n && depth < 20; depth++) {
+        const s: StyleDef | undefined = style.styles[n]
+        const v = s?.paragraph?.[prop]
+        if (v !== undefined) {
+            const m = resolveValue(String(v), `style "${n}"`).match(/^(-?[\d.]+)(cm|mm|pt)$/)
+            return m ? Number(m[1]) * (m[2] === "mm" ? 0.1 : m[2] === "pt" ? PT : 1) : 0
+        }
+        n = s?.parent
+    }
+    return 0
+}
+
+/** Style of the paragraphs of level `lvl` (0-based) in a frame of style `Master-outline1`. */
+function outlineStyle(frameStyle: string, lvl: number): string {
+    return frameStyle.replace(/1$/, String(Math.min(lvl, 8) + 1))
+}
+
 /** `name` or its nearest parent style defining both `bullets` and `numbers`, if any. */
 function listStyleHolder(name: string): string | null {
     for (let n: string | undefined = name, depth = 0; n && depth < 20; depth++) {
@@ -1992,8 +2316,10 @@ function contentXml(b: Builder): string {
     for (const [key, name] of b.colStyles)
         auto.push(`<style:style style:name="${name}" style:family="table-column"><style:table-column-properties style:column-width="${key}cm"/></style:style>`)
     for (const [key, name] of b.paraStyles) {
-        const [pt, indent] = key.split("/")
-        const para = indent ? `<style:paragraph-properties fo:margin-left="${indent}cm"/>` : ""
+        const [pt, indent, margins] = key.split("/")
+        const [top, bottom] = margins ? margins.split(",") : []
+        const props = [indent ? `fo:margin-left="${indent}cm"` : "", margins ? `fo:margin-top="${top}cm" fo:margin-bottom="${bottom}cm"` : ""].filter(Boolean)
+        const para = props.length ? `<style:paragraph-properties ${props.join(" ")}/>` : ""
         auto.push(`<style:style style:name="${name}" style:family="paragraph">${para}<style:text-properties fo:font-size="${pt}pt"/></style:style>`)
     }
     // Lines of the hierarchy boxes of section slides: left aligned (the bullets indent them).
@@ -2170,6 +2496,7 @@ const PRAGMAS: [string, string][] = [
     ["@graph <file.dot>", "Insert a Graphviz diagram (path relative to the .md), rendered as a PNG image by dot."],
     ["@next", "Start a new slide with the same title as the current one (unless a heading follows)."],
     ["@compact", "Shrink the next table so that it fits on one slide, instead of splitting it."],
+    ["@compact [N|*] { ... @}", 'Compact the blocks in between on one slide, flowing through N columns (1 by default, "*": the number giving the biggest text), shrunk if needed.'],
     ["@reveal [C<cols>] [R<rows>]", 'Reveal the rows of the next table one slide after the other; "C1,3 R1-4" keeps columns 1 and 3 and rows 1 to 4 always visible.'],
     ["```prompt ... ```", "Not a pragma: a code block shown as a chat prompt bubble."],
 ]
