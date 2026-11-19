@@ -58,8 +58,50 @@ At the start of a line in the `.md` file:
 | `@compact` | The next table of the section, if it is too long for one slide, has its text shrunk (down to 4pt) until it fits on one slide with the paragraph introducing it, instead of being split into two columns or over several slides. The words of the header are never cut: if one of them is too long for its column, the text is shrunk further, even when the table would fit at full size (a header cell of several words may still wrap between words). |
 | `@compact [N\|*] {` … `@}` | Compact everything in between on one slide, flowing through `N` columns (`@compact {`: one column). The content flows in reading order and the columns are balanced, so the tallest one is as short as possible. A list can be cut between its top-level items (a sub-item stays with its parent, numbering continues), and a table between its rows (its header is repeated at the top of each column). Paragraphs, quotes, code blocks and images are never cut. If there are fewer of these pieces than columns, fewer columns are used. The columns are separated by 1em, and an image takes the width of its column. If the region does not fit on the slide with the paragraph introducing it, everything in it (text, spacing, tables, images) is shrunk by the same factor, half a point of body text at a time, down to 10pt for a 24pt body text. Like a `@compact` table, the region stays on the current slide if it fits there, otherwise it starts a new one with its introduction. `@compact * {` tries 1, 2, 3… columns and keeps the number giving the biggest text, the fewest columns on a tie, avoiding those where a word would be too long for its column. `@note` and `@reveal` work inside a region. A heading, `@next` or `@layout` inside a region, a region inside another one, a region in a cell of an `@layout`, a region not closed by `@}` and an `@}` without a region are errors. |
 | `@reveal [C<columns>] [R<rows>]` | The rows of the next table appear one slide after the other: the first slide shows only the header, each following slide reveals one more row. The table keeps its final size and place from the first slide. `C` and `R` list the columns and the body rows (counted from 1, header excluded) that are always visible, as numbers and ranges: `@reveal C1,3 R1-4` always shows columns 1 and 3 and rows 1 to 4. Both are optional. The speaker notes are repeated on every slide of the sequence. A revealed table always stays on one slide, and its header words are never cut, as with `@compact`: if it is too long, its rows are first spread over two side-by-side tables, and if that is still too long, its text is shrunk, on one table or two side by side, whichever keeps the text bigger. A table inside an `@layout` is shown entirely. |
+| `@anim [<index>] (<property>=<from>:<to>, …) [<duration> [<delay>]] [<easing>] {` … `@}` | Animate everything in between in the slideshow, on the same slide as the rest (see [Animations](#animations)). |
+| `@animation [(<property>=<from>:<to>, …)] [<duration> [<delay>]] [<easing>]` | Defaults of the animations of the current slide: properties and timing (see [Animations](#animations)). |
+| `@box <name> {` … `@}` | Draw the paragraphs, lists and boxes in between in a box, styled by the box `<name>` of the style file: background, text color, font, border, rounded corners, shadow, padding and margin (see [Boxes](#boxes)). Boxes can be nested: each `@}` closes the innermost open box. The box takes the width of the content (or of its column, in a `@compact {` region or an `@layout` cell) and the height of its content. It can be inside a `@compact {` or an `@anim {` region (it is animated as a whole, with its nested boxes), but cannot hold a `@compact {` or `@anim {` region, a heading, an image, a table, a quote or a code block. An unknown box name, a box not closed by `@}` and these blocks inside a box are errors. |
 
 When some files contain `@hint`, the end of the output gives a ready-to-paste prompt asking an AI agent to apply them to the `.odp`.
+
+### Animations
+
+`@anim … {` … `@}` animates the blocks in between with real Impress animations, played by the slideshow, all on one slide:
+
+```md
+@animation (300ms)
+
+@anim 2 (opacity=0.1:1) {
+
+- Foo
+- Bar
+
+@}
+
+Hello world!
+
+@anim 1 (opacity=0.1:1) {
+
+![Alt text](img/toto.png)
+
+@}
+```
+
+When the slide appears, the list and the image have an opacity of 0.1. The first click fades the image in (index 1) in 300ms, the second one fades the list in (index 2), and the next click goes to the next slide.
+
+- **Properties**: `opacity=<from>:<to>` (from 0 to 1) and `scale=<from>:<to>` (`scale=0.5:1`, or `scale=0.5,1:1,1` for different horizontal and vertical scales, around the center of the shape). Several properties are separated by commas: `(opacity=0.1:1, scale=0.5:1)`. The shapes start with the `from` values as soon as the slide appears.
+- **Index**: the integral part of the index is the number of clicks that plays the animation. The gaps do not matter, only the order: indexes 1 and 5 take two clicks. Index 0 (or no index) plays as soon as the slide appears, without a click. In a click, the decimals chain the animations: with indexes 1, 1.2 and 1.5, the click plays 1, then 1.2 once 1 has ended, then 1.5. Animations with the same index play together.
+- **Timing**: as in the CSS `transition` shorthand, the first time (`300ms`, `0.3s`) is the duration and the second one is the delay before the start, and an easing (`linear`, `ease-in`, `ease-out`, `ease-in-out`) can come anywhere: `@anim 1 (opacity=0.1:1) 500ms 200ms ease-out {`. A property can have its own timing: `(opacity=0.1:1 300ms, scale=0.5:1 600ms 100ms)`. The next index of a click starts when the longest animation of the previous one ends, delay included.
+- **`@animation`** gives the defaults of the `@anim` regions of the slide it is on (its section, including the slides it overflows onto), with the same syntax as `@anim` without the index: `@animation (opacity=0.2:0.8 500ms) 300ms ease-out`. The last one of the slide wins, wherever it is. `@animation (300ms)` is a short form for a timing alone. The `@anim` regions inherit what they do not give themselves:
+  - `@anim {` or `@anim 2 300ms {` (no parentheses) takes all the properties of `@animation`, with their values and timing.
+  - `@anim (opacity 900ms) {` (a property without values) takes the values of the same property of `@animation`.
+  - `@anim (scale=0.5:1) {` has its own list of properties: the other properties of `@animation` are not animated.
+  - For each of the duration, the delay and the easing, the first one given wins: on the property in `@anim`, on the `@anim`, on the property in `@animation`, on the `@animation`. Without any, animations last 500ms, with no delay and a linear easing. An `@anim` without properties, or a property without values, that `@animation` does not complete is an error.
+- Each block in a region (paragraph, list, table, image, code…) is a shape of its own, and all of them animate together. A table carries the images of its cells along.
+- A region can be inside a `@compact {` region (a list cut over several columns animates as one), but a `@compact {` region cannot be inside an `@anim {` region. Regions cannot be nested. A heading, `@next` or `@layout` inside a region, a region not closed by `@}`, an unknown property and a value out of range are errors.
+- In an `@layout`, the paragraphs and lists of a cell share a text frame, except across the border of a region.
+- With `@reveal`, the animations play on the last slide of the sequence, once every row is revealed; the slides before it show the `from` values.
+- The animations only exist in the slideshow: the edit view, the printouts and a PDF export show every shape in its static state, fully visible. They can be tweaked afterwards in the Animation sidebar of Impress (they show up as "Transparency" and "Grow and Shrink" effects).
 
 ## Styles
 
@@ -79,16 +121,17 @@ The first conversion of `foo.md` writes `foo.style.json` with the complete defau
 { "theme": { "colors": { "primary": "#800020" } } }
 ```
 
-The file has six top-level sections:
+The file has seven top-level sections:
 
 | Key | Content |
 | --- | --- |
 | `theme` | Colors, fonts, font sizes, slide geometry and diagram options. |
 | `styles` | Every named style, with ODF properties. |
 | `tableTemplates` | Which cell styles a table uses for its header, body and banded rows. |
-| `spanStyles` | Inline formatting: bold, italic, code. |
+| `spanStyles` | Inline formatting: bold, italic, code, strikethrough (`T_s`, for `~~text~~`). |
 | `markers` | Line ends (arrows) used by diagram edges. |
 | `dashes` | Dash patterns used by diagram edges and shapes. |
+| `boxes` | The boxes of `@box <name> {`. |
 
 ### Theme
 
@@ -426,6 +469,52 @@ Like everything else, span styles are merged with the defaults: here `T_code` ke
 `dashes` defines dash patterns, referenced by name in `draw:stroke-dash`, with the ODF attributes of `<draw:stroke-dash>`: `draw:style` (`rect` or `round`), `draw:dots1`, `draw:dots1-length`, `draw:dots2`, `draw:dots2-length` and `draw:distance`.
 
 The **first** entry of `dashes` (`Tirets` by default) is used for `@graph` nodes and edges with `style=dashed` or `style=dotted`.
+
+### Boxes
+
+`boxes` defines the boxes of `@box <name> { … @}`. Boxes can be nested, each `@}` closing the innermost open box:
+
+```md
+@box prompt-assistant {
+Voici la question posée à l'assistant :
+
+@box terminal {
+$ claude "Y a-t-il une jurisprudence ?"
+@}
+
+Et sa réponse : il y a bien une jurisprudence du … qui dit …
+@}
+```
+
+```json
+"boxes": {
+    "prompt-assistant": {
+        "background": "#1F3A5F",
+        "border": "0.05cm dashed {colors.accent}",
+        "radius": "0.5cm",
+        "shadow": "0.15cm 0.15cm 0.2cm #000000 40%",
+        "padding": "0.4cm 0.6cm",
+        "margin": "0cm",
+        "font": "sans",
+        "size": "{sizes.text}pt"
+    }
+}
+```
+
+| Key | Value |
+| --- | --- |
+| `background` | Fill color, `#RRGGBB` or `#RGB` (required). |
+| `color` | Text color, also used for the bullets and numbers of the lists. Missing or `""`: black or white, whichever is more readable on the background. |
+| `border` | `none`, or as in CSS `<width> <solid\|dashed> <color>`, in any order. A dashed border uses the first entry of `dashes`. |
+| `radius` | Radius of the corners, e.g. `0.3cm` (`0cm` for square corners). |
+| `shadow` | `none`, or `<x> <y> [<blur>] <color> [<opacity>]`, e.g. `0.1cm 0.1cm 0.3cm #000000 30%`. |
+| `padding` | Room between the border and the content: `<all>` or `<vertical> <horizontal>` (default `0.4cm 0.6cm`). |
+| `margin` | Room around the box, outside its border: `<all>` or `<vertical> <horizontal>` (default `0cm`). A horizontal margin makes the box narrower than its column; a nested box is also separated by 0.2cm from what follows it. |
+| `font` | Font of the text: `sans` (default, `theme.fonts.sans`), `mono` (`theme.fonts.mono`, e.g. for a terminal or some code) or the name of any installed font family, e.g. `Liberation Serif`. |
+| `size` | Font size of the text (default `{sizes.text}pt`), e.g. `{sizes.code}pt` or `18pt`. |
+| `graphic`, `paragraph`, `text` | Optional ODF properties, merged over those built from the values above, e.g. `"text": { "fo:font-style": "italic", "fo:font-weight": "bold" }`. |
+
+Lengths are in `cm`, `mm`, `pt` or `in`, and every value can use [placeholders](#placeholders). Each box `<name>` becomes the named drawing style `Box-<name>` (content vertically centered, text shrunk if it does not fit), so it can also be changed in LibreOffice afterwards; a style `Box-<name>` in `styles` is merged over it. A box without nested boxes is one shape holding its text. A box holding other boxes is an empty shape, with its nested boxes and its text frames (style `Box-<name>-texte`: the text of `Box-<name>` without fill, border, shadow or padding) drawn over it. Three boxes come by default: `info` (light, with an automatic text color), `warning` (orange with white text) and `terminal` (dark, monospace text of `{sizes.code}pt`, to put in another box).
 
 ### Recipes
 

@@ -65,6 +65,35 @@ export interface BackgroundImage {
     height?: number
 }
 
+/**
+ * Look of the boxes of `@box <name> { ... @}`. Colors and lengths can use theme placeholders.
+ * Each box `<name>` becomes the named graphic style `Box-<name>`.
+ */
+export interface BoxDef {
+    /** Fill color. */
+    background: string
+    /** Text color; when missing or "", black or white, whichever is more readable on the background. */
+    color?: string
+    /** "none", or as in CSS: "<width> <solid|dashed> <color>" (e.g. "0.03cm solid {colors.primary}"). */
+    border: string
+    /** Radius of the corners (e.g. "0.3cm"), "0cm" for square corners. */
+    radius: string
+    /** "none", or "<x> <y> [<blur>] <color> [<opacity>]" (e.g. "0.1cm 0.1cm 0.3cm #000000 30%"). */
+    shadow: string
+    /** Room between the border and the text: "<all>" or "<vertical> <horizontal>" (e.g. "0.4cm 0.6cm"). */
+    padding?: string
+    /** Room around the box, outside its border: "<all>" or "<vertical> <horizontal>" (default "0cm"). */
+    margin?: string
+    /** Font of the text: "sans" (default), "mono" (the fonts of the theme) or the name of a font family. */
+    font?: string
+    /** Font size of the text (default "{sizes.text}pt"). */
+    size?: string
+    /** Extra ODF properties, merged over those built from the values above. */
+    graphic?: Props
+    paragraph?: Props
+    text?: Props
+}
+
 export interface TableTemplate {
     name: string
     header: string
@@ -153,12 +182,14 @@ export interface StyleConfig {
     theme: Theme
     styles: Record<string, StyleDef>
     tableTemplates: TableTemplate[]
-    /** Inline formatting (bold, italic, code). Impress has no character styles, so these are automatic styles. */
+    /** Inline formatting (bold, italic, code, strikethrough). Impress has no character styles, so these are automatic styles. */
     spanStyles: Record<string, Props>
     /** Line ends (arrows), referenced by `draw:marker-start` / `draw:marker-end`. */
     markers: Record<string, { viewBox: string; d: string }>
     /** Dash patterns, referenced by `draw:stroke-dash` (ODF `draw:stroke-dash` attributes). */
     dashes: Record<string, Props>
+    /** Boxes of `@box <name> { ... @}`. */
+    boxes: Record<string, BoxDef>
 }
 
 const sans: Props = { "fo:font-family": "{fonts.sans}", "style:font-family-generic": "swiss" }
@@ -479,11 +510,42 @@ export const defaultStyle: StyleConfig = {
     dashes: {
         Tirets: { "draw:style": "rect", "draw:dots1": "1", "draw:dots1-length": "0.2cm", "draw:distance": "0.15cm" },
     },
+    boxes: {
+        /** No `color`: black or white, whichever is more readable on the background. */
+        info: {
+            background: "{colors.quoteBackground}",
+            border: "0.03cm solid {colors.primary}",
+            radius: "0.3cm",
+            shadow: "0.1cm 0.1cm 0.3cm {colors.muted} 30%",
+            padding: "0.4cm 0.6cm",
+        },
+        warning: {
+            background: "{colors.accent}",
+            color: "{colors.white}",
+            border: "none",
+            radius: "0.3cm",
+            shadow: "0.1cm 0.1cm 0.3cm {colors.muted} 30%",
+            padding: "0.4cm 0.6cm",
+        },
+        /** Monospace text, e.g. a terminal output inside another box. */
+        terminal: {
+            background: "#1E1E1E",
+            border: "none",
+            radius: "0.15cm",
+            shadow: "none",
+            padding: "0.25cm 0.4cm",
+            margin: "0.1cm 0cm",
+            font: "mono",
+            size: "{sizes.code}pt",
+        },
+    },
     spanStyles: {
         T_b: { "fo:font-weight": "bold" },
         T_i: { "fo:font-style": "italic" },
         T_bi: { "fo:font-weight": "bold", "fo:font-style": "italic" },
         T_code: mono,
+        /** Strikethrough: `~~text~~`. Nested around the other span styles, so it combines with them. */
+        T_s: { "style:text-line-through-style": "solid", "style:text-line-through-type": "single" },
         /** Highlighted section in the hierarchy box of a section slide. */
         T_section: { "fo:font-weight": "bold", "fo:color": "{colors.sectionHighlight}" },
     },

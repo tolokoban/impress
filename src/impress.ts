@@ -29,6 +29,14 @@
  *                           default, "*" for the number giving the biggest text), shrunk if needed
  *   @reveal C1,3 R1-4       the rows of the next table appear one slide after the other; the
  *                           columns (C) and rows (R) listed, both optional, are always visible
+ *   @anim 1.5 (opacity=0.1:1, scale=0.5:1) 300ms 100ms ease-out { ... @}
+ *                           the blocks in between are animated in the slideshow: integral part of
+ *                           the index = number of clicks, decimals = chained in the same click
+ *   @box info { ... @}      the paragraphs, lists and boxes in between are drawn in a box, styled
+ *                           by the box "info" of the `boxes` of the style file (nestable)
+ *   @animation (opacity=0.1:1) 300ms
+ *                           defaults of the `@anim` of the slide (properties, duration, delay,
+ *                           easing): `@anim {` takes them all, `@anim (opacity) {` the values
  *   ```prompt ... ```       chat prompt bubble
  */
 import { existsSync, readFileSync, writeFileSync, statSync } from "node:fs"
@@ -69,6 +77,8 @@ let CENTER = false
 
 function useStyle(config: StyleConfig) {
     style = config
+    // The boxes of `@box` become named styles (their values can use the theme, hence `style` first).
+    style = { ...config, styles: { ...config.styles, ...boxStyles(config) } }
     sizes = config.theme.sizes
     SLIDE_W = config.theme.slide.width
     SLIDE_H = config.theme.slide.height
@@ -122,26 +132,287 @@ function resolveValue(value: string, where: string): string {
     })
 }
 
+// ---------------------------------------------------------------- boxes (`@box`)
+
+/** Named graphic style of the boxes `@box <name> {`. */
+const boxStyleName = (name: string) => `Box-${name}`
+/** Named graphic style of the text frames of the boxes `name` holding other boxes. */
+const boxTextStyleName = (name: string) => `Box-${name}-texte`
+
+/** A length ("0.3cm", "3mm", "8pt", "0.1in") in cm. */
+function lengthCm(value: string, where: string): number {
+    const m = value.match(/^(-?(?:\d+(?:\.\d+)?|\.\d+))(cm|mm|pt|in)$/)
+    if (!m) throw new Error(`${where}: invalid length "${value}" (expected e.g. 0.3cm, 3mm or 8pt)`)
+    return Number(m[1]) * { cm: 1, mm: 0.1, pt: PT, in: 2.54 }[m[2] as "cm" | "mm" | "pt" | "in"]
+}
+
+/** `#RRGGBB` or `#RGB` as [red, green, blue] from 0 to 255, or null. */
+function rgb(color: string): [number, number, number] | null {
+    const long = color.match(/^#([0-9a-f]{6})$/i)
+    if (long) {
+        const n = parseInt(long[1], 16)
+        return [n >> 16, (n >> 8) & 255, n & 255]
+    }
+    const short = color.match(/^#([0-9a-f]{3})$/i)
+    return short ? ([...short[1]].map(c => parseInt(c + c, 16)) as [number, number, number]) : null
+}
+
+/** Black or white, whichever contrasts most with `background` (WCAG contrast ratio). */
+function readableOn(background: string): string {
+    const [r, g, b] = rgb(background)!.map(v => {
+        v /= 255
+        return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4
+    })
+    const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+    return 1.05 / (lum + 0.05) >= (lum + 0.05) / 0.05 ? "#FFFFFF" : "#000000"
+}
+
+/** Geometry of a box, in cm: padding and margin (vertical and horizontal), and corner radius. */
+type BoxGeom = { padY: number; padX: number; marginY: number; marginX: number; radius: number }
+
+function boxGeom(name: string, box = style.boxes[name]): BoxGeom {
+    const where = `box "${name}" of the style file`
+    const lengths = (spec: string) => resolveValue(spec, where).trim().split(/\s+/).filter(Boolean)
+    /** `<all>` or `<vertical> <horizontal>`. */
+    const pair = (key: "padding" | "margin", spec: string): [number, number] => {
+        const v = lengths(spec).map(x => lengthCm(x, `${where}, "${key}"`))
+        if (v.length < 1 || v.length > 2) throw new Error(`${where}: "${key}" must be "<all>" or "<vertical> <horizontal>", got "${spec}"`)
+        return [v[0], v[1] ?? v[0]]
+    }
+    const [padY, padX] = pair("padding", box.padding ?? "0.4cm 0.6cm")
+    const [marginY, marginX] = pair("margin", box.margin ?? "0cm")
+    const radius = lengths(box.radius ?? "0cm")
+    if (radius.length !== 1) throw new Error(`${where}: "radius" must be one length (e.g. 0.3cm), got "${box.radius}"`)
+    return { padY, padX, marginY, marginX, radius: lengthCm(radius[0], `${where}, "radius"`) }
+}
+
+/** Font properties of `font`: "sans", "mono" or the name of a font family. */
+function boxFont(font: string): Props {
+    if (font === "" || font === "sans") return { "fo:font-family": "{fonts.sans}", "style:font-family-generic": "swiss" }
+    if (font === "mono") return { "fo:font-family": "{fonts.mono}", "style:font-family-generic": "modern" }
+    return { "fo:font-family": /^['{]/.test(font) ? font : `'${font}'` }
+}
+
+/** `none` or `<width> <solid|dashed> <color>`, in any order. */
+function boxBorder(spec: string, where: string): Props {
+    if (spec === "" || spec === "none") return { "draw:stroke": "none" }
+    let [width, dashed, color] = ["0.03cm", false, "#000000"]
+    for (const tok of spec.split(/\s+/)) {
+        if (tok === "solid" || tok === "dashed") dashed = tok === "dashed"
+        else if (rgb(tok)) color = tok
+        else width = (lengthCm(tok, `${where}, "border"`), tok)
+    }
+    const dash = Object.keys(style.dashes)[0]
+    return {
+        "draw:stroke": dashed && dash ? "dash" : "solid",
+        ...(dashed && dash && { "draw:stroke-dash": dash }),
+        "svg:stroke-color": color,
+        "svg:stroke-width": width,
+    }
+}
+
+/** `none` or `<x> <y> [<blur>] <color> [<opacity>]`. */
+function boxShadow(spec: string, where: string): Props {
+    if (spec === "" || spec === "none") return { "draw:shadow": "hidden" }
+    const lengths: string[] = []
+    let color = ""
+    let opacity = "100%"
+    for (const tok of spec.split(/\s+/)) {
+        if (rgb(tok)) color = tok
+        else if (/^\d+(\.\d+)?%$/.test(tok)) opacity = tok
+        else lengths.push((lengthCm(tok, `${where}, "shadow"`), tok))
+    }
+    if (lengths.length < 2 || lengths.length > 3 || !color)
+        throw new Error(`${where}: "shadow" must be "none" or "<x> <y> [<blur>] <color> [<opacity>]" (e.g. "0.1cm 0.1cm 0.3cm #000000 30%"), got "${spec}"`)
+    return {
+        "draw:shadow": "visible",
+        "draw:shadow-offset-x": lengths[0],
+        "draw:shadow-offset-y": lengths[1],
+        "draw:shadow-color": color,
+        "draw:shadow-opacity": opacity,
+        ...(lengths[2] && { "loext:shadow-blur": lengths[2] }),
+    }
+}
+
+/**
+ * Named styles `Box-<name>` of the boxes of the style file. A style `Box-<name>` of `styles`, if
+ * any, is merged over the one built from the box.
+ */
+function boxStyles(config: StyleConfig): Record<string, StyleDef> {
+    const out: Record<string, StyleDef> = {}
+    for (const [name, box] of Object.entries(config.boxes ?? {})) {
+        const where = `box "${name}" of the style file`
+        const value = (v: string | undefined) => resolveValue(v ?? "", where).trim()
+        const background = value(box.background)
+        if (!rgb(background)) throw new Error(`${where}: "background" must be a color like #DCEBFF, got "${box.background ?? ""}"`)
+        const color = value(box.color) || readableOn(background)
+        const { padY, padX } = boxGeom(name, box)
+        const list = config.styles["Master-outline1"]
+        const def: StyleDef = {
+            family: "graphic",
+            parent: "standard",
+            graphic: {
+                "draw:auto-grow-height": "false",
+                "draw:auto-grow-width": "false",
+                "draw:fit-to-size": "false",
+                "style:shrink-to-fit": "true",
+                "draw:fill": "solid",
+                "draw:fill-color": background,
+                ...boxBorder(value(box.border), where),
+                ...boxShadow(value(box.shadow), where),
+                "fo:padding-top": `${f2(padY)}cm`,
+                "fo:padding-bottom": `${f2(padY)}cm`,
+                "fo:padding-left": `${f2(padX)}cm`,
+                "fo:padding-right": `${f2(padX)}cm`,
+                "draw:textarea-vertical-align": "middle",
+                ...box.graphic,
+            },
+            paragraph: { "fo:margin-top": "0cm", "fo:margin-bottom": "0.2cm", "fo:line-height": "110%", ...box.paragraph },
+            text: { ...boxFont(box.font ?? ""), "fo:font-size": box.size ?? "{sizes.text}pt", "fo:color": color, ...box.text },
+            // The bullets and numbers of the slides, in the color of the text of the box.
+            ...(list?.bullets && { bullets: { ...list.bullets, color } }),
+            ...(list?.numbers && { numbers: { ...list.numbers, color } }),
+        }
+        const own = config.styles[boxStyleName(name)]
+        out[boxStyleName(name)] = own ? deepMerge(def, own) : def
+        // Text frames of a box holding other boxes: the text of the box, without its frame.
+        out[boxTextStyleName(name)] = {
+            family: "graphic",
+            parent: boxStyleName(name),
+            graphic: {
+                "draw:fill": "none",
+                "draw:stroke": "none",
+                "draw:shadow": "hidden",
+                "fo:padding-top": "0cm",
+                "fo:padding-bottom": "0cm",
+                "fo:padding-left": "0cm",
+                "fo:padding-right": "0cm",
+                "draw:textarea-vertical-align": "top",
+            },
+        }
+    }
+    return out
+}
+
+/** Font size of the text of the boxes `name`, in points. */
+function boxPt(name: string): number {
+    const size = style.styles[boxStyleName(name)]?.text?.["fo:font-size"]
+    const m = size ? resolveValue(size, `style "${boxStyleName(name)}"`).match(/^([\d.]+)pt$/) : null
+    return m ? Number(m[1]) : sizes.text
+}
+
+/** Is the text of the boxes `name` in the monospace font of the theme? Its characters are wider. */
+function boxIsMono(name: string): boolean {
+    const family = style.styles[boxStyleName(name)]?.text?.["fo:font-family"]
+    return !!family && resolveValue(family, `style "${boxStyleName(name)}"`) === style.theme.fonts.mono
+}
+
+/** What a box holds, in order: runs of paragraphs and lists (one text frame each), and boxes. */
+type BoxItem = { kind: "text"; blocks: Block[] } | { kind: "box"; box: BoxBlock }
+
+function boxItems(b: BoxBlock): BoxItem[] {
+    const items: BoxItem[] = []
+    for (const x of b.blocks) {
+        const last = items[items.length - 1]
+        // Nested boxes are shrunk with their parent (`@compact {`).
+        if (x.t === "box") items.push({ kind: "box", box: b.k === undefined ? x : { ...x, k: b.k } })
+        else if (last?.kind === "text") last.blocks.push(x)
+        else items.push({ kind: "text", blocks: [x] })
+    }
+    return items
+}
+
+/** Space between a nested box and what follows it in its parent. */
+const BOX_GAP = 0.2
+
+/** Height of the paragraphs and lists of the boxes `name`, `width` wide. */
+function boxTextH(name: string, blocks: Block[], width: number, k: number): number {
+    const pt = boxPt(name) * k
+    // Monospace characters are about 20% wider than those `textH()` assumes.
+    const chars = (text: string) => plainLen(text) * (boxIsMono(name) ? 1.2 : 1)
+    let h = 0
+    for (const x of blocks) {
+        if (x.t === "para") h += x.text.split("\n").reduce((a, p) => a + textH(chars(p), width, pt), 0) + 0.2 * k
+        else if (x.t === "list") for (const [lvl, txt] of x.items) h += textH(chars(txt), width - 0.9 * (lvl + 1), pt) + 0.2 * k
+    }
+    return h
+}
+
+/** Height of the content of a box (inside its padding), `width` being the room inside its padding. */
+function boxContentH(b: BoxBlock, width: number): number {
+    const k = b.k ?? 1
+    return boxItems(b).reduce(
+        (h, it, i, all) => h + (it.kind === "text" ? boxTextH(b.name, it.blocks, width, k) : boxH(it.box, width) + (i < all.length - 1 ? BOX_GAP * k : 0)),
+        0,
+    )
+}
+
+/** Height of a box `width` wide, margins included. */
+function boxH(b: BoxBlock, width: number): number {
+    const { padY, padX, marginY, marginX } = boxGeom(b.name)
+    return boxContentH(b, width - 2 * (padX + marginX)) + 2 * (padY + marginY)
+}
+
 // ---------------------------------------------------------------- parsing
 
 /** [level (0 = top), text, number of the item (numbered lists only)]. */
 type ListItem = [number, string, number?]
 
 type Block =
-    | ({ t: "para"; text: string } & Scaled)
-    | ({ t: "list"; items: ListItem[] } & Scaled)
-    | ({ t: "quote"; text: string } & Scaled)
-    | ({ t: "prompt" | "code"; lines: string[] } & Scaled)
+    | ({ t: "para"; text: string } & Scaled & Animated)
+    | ({ t: "list"; items: ListItem[] } & Scaled & Animated)
+    | ({ t: "quote"; text: string } & Scaled & Animated)
+    | ({ t: "prompt" | "code"; lines: string[] } & Scaled & Animated)
     | TableBlock
-    | ({ t: "image"; alt: string; src: string } & Scaled)
+    | ({ t: "image"; alt: string; src: string } & Scaled & Animated)
     | { t: "note"; text: string }
     /** `----`: a horizontal rule across the content. */
-    | { t: "hr" }
+    | ({ t: "hr" } & Animated)
     | { t: "layout"; layout: Layout; cells: Section[] }
     | CompactBlock
+    | BoxBlock
+
+/** `@box <name> { ... @}`: paragraphs and lists in a box styled by `Box-<name>`. */
+type BoxBlock = {
+    t: "box"
+    /** Name of the box in the `boxes` of the style file. */
+    name: string
+    blocks: Block[]
+    /** `file:line` of the `@box {`, for the messages. */
+    where: string
+} & Scaled &
+    Animated
 
 /** Font scale of a block of a `@compact {` region (1 when undefined). */
 type Scaled = { k?: number }
+
+/** Block of an `@anim {` region: its shapes are animated in the slideshow. */
+type Animated = { anim?: Anim }
+
+function animOf(b: Block): Anim | undefined {
+    return (b as Animated).anim
+}
+
+const EASES = ["linear", "ease-in", "ease-out", "ease-in-out"] as const
+type Ease = (typeof EASES)[number]
+
+/** Duration and delay in seconds, and easing: each one undefined when not given. */
+type Timing = { dur?: number; delay?: number; ease?: Ease }
+
+/**
+ * An animated property, with its values (one number for `opacity`, x and y for `scale`). In an
+ * `@anim`, the values can be missing: those of the same property of `@animation` are taken.
+ */
+type AnimProp = { name: "opacity" | "scale"; from?: number[]; to?: number[] } & Timing
+
+/**
+ * `@anim 1.5 (opacity=0.1:1) 300ms {`: the animation of the blocks of a region. Without
+ * properties (`@anim {`), it takes those of the `@animation` of its slide.
+ */
+type Anim = { index: number; props?: AnimProp[]; where: string } & Timing
+
+/** `@animation (opacity=0.1:1 500ms) 300ms`: the defaults of the `@anim` of a slide. */
+type Animation = { props?: AnimProp[] } & Timing
 
 /**
  * `@compact N { ... @}`: blocks compacted on one slide, flowing through `columns` columns.
@@ -176,6 +447,7 @@ type TableBlock = {
     reveal?: Reveal
     /** Rows revealed on the current slide (all of them when undefined). */
     shown?: Set<string[]>
+    anim?: Anim
 }
 
 /** `@reveal C1,3 R1-4`: what stays visible while the rows of a table are revealed. */
@@ -245,6 +517,8 @@ class Section {
     layout: Layout | null = null
     /** Created by `@next`: continues the previous section on a new slide. */
     continued = false
+    /** Set by `@animation`: defaults of the animations of its slides (properties and timing). */
+    animation: Animation = {}
 
     /** Folder of the markdown file, for relative image paths. */
     source: string
@@ -268,6 +542,7 @@ function stripMd(s: string): string {
         .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
         .replaceAll("**", "")
         .replaceAll("__", "")
+        .replaceAll("~~", "")
         .replace(/(?<![\p{L}\p{N}_])\*(.+?)\*(?![\p{L}\p{N}_])/gu, "$1")
         .trim()
 }
@@ -280,6 +555,82 @@ const HEAD_RE = /^(#{1,6})\s+(.*)$/
 const HR_RE = /^-{3,}$/
 /** `@compact {`, `@compact 3 {` or `@compact * {`. */
 const COMPACT_RE = /^@compact\s*(\d+|\*)?\s*\{$/
+/** `@box <name> {`. */
+const BOX_RE = /^@box\s+([\w-]+)\s*\{$/
+/**
+ * `@anim 1.5 (opacity=0.1:1) 300ms 100ms ease-out {`: index, properties, timing, all optional.
+ * The index is not followed by a letter, so `@anim 300ms {` is a duration.
+ */
+const ANIM_RE = /^@anim(?:\s+(\d+(?:\.\d+)?|\.\d+)(?![\w.]))?\s*(?:\((.*)\))?\s*(.*?)\s*\{$/
+/** `@animation (opacity=0.1:1 500ms) 300ms ease-out`, or the short form `@animation (300ms)`. */
+const ANIMATION_RE = /^@animation(?:\s*\((.*)\))?\s*(.*)$/
+
+const isTimingToken = (tok: string) => /^(\d+(?:\.\d+)?|\.\d+)(ms|s)$/.test(tok) || (EASES as readonly string[]).includes(tok)
+
+/** `@animation`: its properties (with their values) and its timing. */
+function parseAnimation(s: string, where: string): Animation {
+    const m = s.match(ANIMATION_RE)
+    const [inner, rest] = [(m?.[1] ?? "").trim(), (m?.[2] ?? "").trim()]
+    const tokens = (t: string) => t.split(/\s+/).filter(Boolean)
+    if (!m || (m[1] === undefined && rest && !tokens(rest).every(isTimingToken)))
+        throw new Error(`${where}: expected "@animation [(<property>=<from>:<to>, ...)] [<duration> [<delay>]] [<easing>]" (e.g. "@animation (opacity=0.1:1) 300ms"), got "${s}"`)
+    // `@animation (300ms ease-out)`: only a timing in the parentheses.
+    if (inner && tokens(inner).every(isTimingToken)) {
+        if (rest) throw new Error(`${where}: "@animation" has two timings, in and after its parentheses`)
+        return parseTiming(tokens(inner), where, '"@animation"')
+    }
+    const props = inner ? parseAnimProps(inner, where, true) : undefined
+    return { ...(props && { props }), ...parseTiming(tokens(rest), where, '"@animation"') }
+}
+
+/**
+ * Timing as in the CSS `transition` shorthand: the first time is the duration, the second one
+ * the delay, and an easing keyword can be anywhere. Times are in `ms` or `s`.
+ */
+function parseTiming(tokens: string[], where: string, what: string): Timing {
+    const t: Timing = {}
+    const times: number[] = []
+    for (const tok of tokens) {
+        const m = tok.match(/^(\d+(?:\.\d+)?|\.\d+)(ms|s)$/)
+        if (m) times.push(Number(m[1]) / (m[2] === "ms" ? 1000 : 1))
+        else if ((EASES as readonly string[]).includes(tok)) t.ease = tok as Ease
+        else throw new Error(`${where}: unexpected "${tok}" in ${what} (expected a duration and a delay like 300ms or 0.3s, or an easing: ${EASES.join(", ")})`)
+    }
+    if (times.length > 2) throw new Error(`${where}: too many times in ${what}: the first one is the duration, the second one the delay`)
+    if (times.length) t.dur = times[0]
+    if (times.length > 1) t.delay = times[1]
+    return t
+}
+
+/**
+ * `opacity=0.1:1 300ms, scale=0.5,1:1,1`: animated properties, with their own timing. Unless
+ * `valuesRequired` (`@animation`), a property can come without values (`opacity 300ms`): those of
+ * the `@animation` of the slide are taken.
+ */
+function parseAnimProps(spec: string, where: string, valuesRequired: boolean): AnimProp[] {
+    const props: AnimProp[] = []
+    // Commas also separate the x and y of a scale: only a comma followed by a name separates properties.
+    for (const part of spec.split(/,\s*(?=[a-z])/i).map(p => p.trim())) {
+        const m = part.match(/^([a-z][\w-]*)(?:\s*=\s*([^:\s]+)\s*:\s*(\S+))?(?:\s+(.*))?$/i)
+        if (!m || (valuesRequired && m[2] === undefined))
+            throw new Error(`${where}: expected "<property>=<from>:<to>" (e.g. "opacity=0.1:1"${valuesRequired ? "" : ', or "opacity" for the values of "@animation"'}), got "${part}"`)
+        const name = m[1]
+        if (name !== "opacity" && name !== "scale") throw new Error(`${where}: unknown animated property "${name}" (only opacity and scale are supported)`)
+        if (props.some(p => p.name === name)) throw new Error(`${where}: "${name}" is animated twice`)
+        const values = (s: string): number[] => {
+            const ns = s.split(",").map(Number)
+            const count = name === "opacity" ? [1] : [1, 2]
+            if (!count.includes(ns.length) || ns.some(n => !Number.isFinite(n) || n < 0 || (name === "opacity" && n > 1)))
+                throw new Error(
+                    `${where}: invalid ${name} value "${s}" (${name === "opacity" ? "a number from 0 to 1" : 'a positive number, or "x,y" for different horizontal and vertical scales'})`,
+                )
+            return ns.length === 1 && name === "scale" ? [ns[0], ns[0]] : ns
+        }
+        const timing = parseTiming((m[4] ?? "").split(/\s+/).filter(Boolean), where, `the timing of "${name}"`)
+        props.push({ name, ...(m[2] !== undefined && { from: values(m[2]), to: values(m[3]) }), ...timing })
+    }
+    return props
+}
 
 function parse(md: string, file: string): Section {
     const root = new Section(0, "", null, dirname(file))
@@ -289,6 +640,16 @@ function parse(md: string, file: string): Section {
     let list: { t: "list"; items: ListItem[] } | null = null
     // Open `@compact {` region: its blocks go into it until `@}`.
     let region: CompactBlock | null = null
+    // Open `@anim {` region: its blocks are animated until `@}`, and how many there are.
+    let animRegion: Anim | null = null
+    let animated = 0
+    // Open `@box {` regions, innermost last, and the innermost one: its blocks go into it until `@}`.
+    const boxes: BoxBlock[] = []
+    let box: BoxBlock | null = null
+    // Line of the markdown being parsed (1-based), for the messages.
+    let lineNo = 0
+    // Kinds of the open regions, innermost last: `@}` closes the last one.
+    const open: ("compact" | "anim" | "box")[] = []
     let layout: Layout | null = null
     // `@layout` followed by content instead of a heading: the next blocks fill its cells.
     let grouped: { t: "layout"; layout: Layout; cells: Section[] } | null = null
@@ -306,6 +667,18 @@ function parse(md: string, file: string): Section {
     }
 
     const push = (b: Block) => {
+        // The box is animated as a whole: its blocks are not animated on their own.
+        if (box && b.t !== "note") {
+            if (b.t !== "para" && b.t !== "list" && b.t !== "box") {
+                const what = { image: "an image", table: "a table", quote: "a quote", prompt: "a prompt", code: "a code block", hr: "a horizontal rule" }[b.t as string] ?? `a ${b.t}`
+                throw new Error(`${file}:${lineNo}: a "@box {" region can only hold paragraphs, lists and boxes, not ${what} (box opened at line ${box.where.split(":").pop()})`)
+            }
+            return void box.blocks.push(b)
+        }
+        if (animRegion && b.t !== "note") {
+            ;(b as Animated).anim = animRegion
+            animated++
+        }
         if (region) return void region.blocks.push(b)
         if (!grouped) return void cur.blocks.push(b)
         const cells = grouped.cells
@@ -342,9 +715,12 @@ function parse(md: string, file: string): Section {
         const line = lines[i]
         const s = line.trim()
         let m: RegExpMatchArray | null
-        if (region && (HEAD_RE.test(line) || s === "@next" || s.startsWith("@layout"))) {
+        lineNo = i + 1
+        const inner = box ?? animRegion ?? region
+        if (inner && (HEAD_RE.test(line) || s === "@next" || s.startsWith("@layout"))) {
             const what = HEAD_RE.test(line) ? "a heading" : s === "@next" ? '"@next"' : '"@layout"'
-            throw new Error(`${file}:${i + 1}: ${what} cannot be inside a "@compact {" region (opened at line ${region.where.split(":").pop()}, closed by "@}")`)
+            const kind = inner === box ? 'a "@box' : inner === animRegion ? 'an "@anim' : 'a "@compact'
+            throw new Error(`${file}:${i + 1}: ${what} cannot be inside ${kind} {" region (opened at line ${inner.where.split(":").pop()}, closed by "@}")`)
         }
         if ((m = line.match(HEAD_RE))) {
             flush()
@@ -382,7 +758,10 @@ function parse(md: string, file: string): Section {
             cur = sec
         } else if ((m = s.match(COMPACT_RE))) {
             const where = `${file}:${i + 1}`
+            if (box) throw new Error(`${where}: a "@compact {" region cannot be inside a "@box {" region (opened at line ${box.where.split(":").pop()}); put the "@box {" inside the "@compact {" instead`)
             if (region) throw new Error(`${where}: "@compact {" regions cannot be nested (one is already open since line ${region.where.split(":").pop()})`)
+            if (animRegion)
+                throw new Error(`${where}: a "@compact {" region cannot be inside an "@anim {" region (opened at line ${animRegion.where.split(":").pop()}); put the "@anim {" inside the "@compact {" instead`)
             flush()
             dropCompact()
             dropReveal()
@@ -391,13 +770,60 @@ function parse(md: string, file: string): Section {
             const b: CompactBlock = { t: "compact", columns, blocks: [], where }
             push(b)
             region = b
-        } else if (s === "@}") {
-            if (!region) throw new Error(`${file}:${i + 1}: "@}" without an open "@compact {" region`)
+            open.push("compact")
+        } else if (s.startsWith("@animation")) {
+            const where = `${file}:${i + 1}`
+            cur.animation = parseAnimation(s, where)
+        } else if ((m = s.match(ANIM_RE))) {
+            const where = `${file}:${i + 1}`
+            if (box) throw new Error(`${where}: an "@anim {" region cannot be inside a "@box {" region (opened at line ${box.where.split(":").pop()}); put the "@box {" inside the "@anim {" instead`)
+            if (animRegion) throw new Error(`${where}: "@anim {" regions cannot be nested (one is already open since line ${animRegion.where.split(":").pop()})`)
             flush()
             dropCompact()
             dropReveal()
-            if (!region.blocks.some(b => b.t !== "note")) console.warn(`  ! ${bold(region.where)}: empty "@compact {" region`)
-            region = null
+            const timing = parseTiming(m[3].split(/\s+/).filter(Boolean), where, '"@anim"')
+            // `@anim {` or `@anim () {`: the properties of the `@animation` of the slide.
+            const props = m[2]?.trim() ? parseAnimProps(m[2], where, false) : undefined
+            animRegion = { index: Number(m[1] ?? 0), ...(props && { props }), where, ...timing }
+            animated = 0
+            open.push("anim")
+        } else if (s.startsWith("@anim")) {
+            throw new Error(`${file}:${i + 1}: expected "@anim [<index>] (<property>=<from>:<to>, ...) [<duration> [<delay>]] [<easing>] {" (e.g. "@anim 1 (opacity=0.1:1) {"), got "${s}"`)
+        } else if ((m = s.match(BOX_RE))) {
+            const where = `${file}:${i + 1}`
+            const name = m[1]
+            if (!style.boxes[name]) {
+                const known = Object.keys(style.boxes)
+                throw new Error(`${where}: unknown box "${name}": add it to the "boxes" of the style file (known boxes: ${known.length ? known.join(", ") : "none"})`)
+            }
+            flush()
+            dropCompact()
+            dropReveal()
+            const b: BoxBlock = { t: "box", name, blocks: [], where }
+            // Inside another box, it goes into that box.
+            push(b)
+            boxes.push(b)
+            box = b
+            open.push("box")
+        } else if (s.startsWith("@box")) {
+            throw new Error(`${file}:${i + 1}: expected "@box <name> {" (e.g. "@box info {"), got "${s}"`)
+        } else if (s === "@}") {
+            const kind = open.pop()
+            if (!kind) throw new Error(`${file}:${i + 1}: "@}" without an open "@compact {", "@anim {" or "@box {" region`)
+            flush()
+            dropCompact()
+            dropReveal()
+            if (kind === "box") {
+                if (!box!.blocks.length) console.warn(`  ! ${bold(box!.where)}: empty "@box {" region`)
+                boxes.pop()
+                box = boxes[boxes.length - 1] ?? null
+            } else if (kind === "anim") {
+                if (!animated) console.warn(`  ! ${bold(animRegion!.where)}: empty "@anim {" region`)
+                animRegion = null
+            } else {
+                if (!region!.blocks.some(b => b.t !== "note")) console.warn(`  ! ${bold(region!.where)}: empty "@compact {" region`)
+                region = null
+            }
         } else if (s === "@compact") {
             flush()
             dropCompact()
@@ -491,6 +917,8 @@ function parse(md: string, file: string): Section {
     flush()
     dropCompact()
     dropReveal()
+    if (box) throw new Error(`${(box as BoxBlock).where}: "@box {" region not closed by "@}"`)
+    if (animRegion) throw new Error(`${(animRegion as Anim).where}: "@anim {" region not closed by "@}"`)
     if (region) throw new Error(`${(region as CompactBlock).where}: "@compact {" region not closed by "@}"`)
     if (layout) console.warn(`  ! ${bold(file)}: "${(layout as Layout).source}" is not followed by any section`)
     return root
@@ -507,6 +935,7 @@ const INLINE_PATTERNS: [string, RegExp][] = [
     ["b", /\*\*(.+?)\*\*/s],
     ["i", /(?<![\p{L}\p{N}_*])\*(?!\s)(.+?)(?<!\s)\*(?![\p{L}\p{N}_*])/su],
     ["code", /`([^`]+)`/],
+    ["s", /~~(?!\s)(.+?)(?<!\s)~~/s],
 ]
 
 function inline(s: string, fmt = new Set<string>(), href: string | null = null): Run[] {
@@ -568,6 +997,7 @@ function runsXml(text: string): string {
             let x = xmlText(text)
             const st = spanStyle(fmt)
             if (st) x = `<text:span text:style-name="${st}">${x}</text:span>`
+            if (fmt.has("s")) x = `<text:span text:style-name="T_s">${x}</text:span>`
             if (href) x = `<text:a xlink:type="simple" xlink:href="${esc(href)}">${x}</text:a>`
             return x
         })
@@ -805,6 +1235,8 @@ function blockH(b: Block, width: number): number {
             return HR_H
         case "compact":
             return arrange(b, width).h
+        case "box":
+            return boxH(b, width)
         default:
             return 0
     }
@@ -1296,6 +1728,8 @@ type Page = {
     sec: Section | null
     /** Section slide whose hierarchy box is added once the next slide is known (see `Builder.finish()`). */
     toc?: Section
+    /** Timing tree of the animations of the slide (`@anim`), if any. */
+    timing?: string
 }
 
 /** Geometry of section slides: title at the top, bar under it, then the box of the hierarchy. */
@@ -1320,8 +1754,132 @@ function revealSteps(content: Block[]): Block[][] {
     })
 }
 
+/** An animated shape of a slide: its `draw:id` and its animation. */
+type AnimShape = { id: string; anim: Anim }
+
+/** Timing of the animations without any `@animation` on their slide. */
+const DEFAULT_TIMING = { dur: 0.5, delay: 0, ease: "linear" as Ease }
+
+const secs = (s: number) => `${Number(s.toFixed(3))}s`
+
+const EASE_ATTRS: Record<Ease, string> = {
+    linear: "",
+    "ease-in": ' smil:accelerate="1"',
+    "ease-out": ' smil:decelerate="1"',
+    "ease-in-out": ' smil:accelerate="0.5" smil:decelerate="0.5"',
+}
+
+/** Presets of Impress for the effects, so that its Animation sidebar names them. */
+const ANIM_PRESETS: Record<AnimProp["name"], string> = {
+    opacity: 'presentation:preset-class="emphasis" presentation:preset-id="ooo-emphasis-transparency"',
+    scale: 'presentation:preset-class="emphasis" presentation:preset-id="ooo-emphasis-grow-and-shrink"',
+}
+
+/** An animated property with its values. */
+type Values = { name: AnimProp["name"]; from: number[]; to: number[] }
+
+/**
+ * The properties of an `@anim`, with their values and timing, completed by the `@animation` of its
+ * slide: without properties, the `@anim` takes those of `@animation`; a property without values
+ * takes the values of the same property of `@animation`. What is given explicitly in the `@anim`
+ * always wins: for each of the duration, the delay and the easing, the first one given among the
+ * property in `@anim`, the `@anim`, the property in `@animation`, the `@animation`, else the default.
+ */
+function animProps(anim: Anim, slide: Animation): (Values & Required<Timing>)[] {
+    const list = anim.props ?? slide.props
+    if (!list?.length)
+        throw new Error(`${anim.where}: this "@anim" has no properties, and no "@animation" of its slide gives them (e.g. "@animation (opacity=0.1:1)")`)
+    return list.map(p => {
+        // Inherited from `@animation` as a whole, the property is the base and the `@anim` overrides it.
+        const own: Partial<AnimProp> = anim.props ? p : {}
+        const base = slide.props?.find(d => d.name === p.name)
+        const from = own.from ?? base?.from
+        const to = own.to ?? base?.to
+        if (!from || !to) throw new Error(`${anim.where}: "${p.name}" has no values, and no "@animation" of its slide gives them (e.g. "@animation (${p.name}=0.1:1)")`)
+        const pick = <K extends keyof Timing>(k: K): Required<Timing>[K] => (own[k] ?? anim[k] ?? base?.[k] ?? slide[k] ?? DEFAULT_TIMING[k]) as Required<Timing>[K]
+        return { name: p.name, from, to, dur: pick("dur"), delay: pick("delay"), ease: pick("ease") }
+    })
+}
+
+/**
+ * Timing tree of the animations of a slide (`anim:par` of `content.xml`, checked against what
+ * LibreOffice reads and writes). The shapes are first set to the start values of their properties,
+ * with the animations of index 0, as soon as the slide appears. Then each click plays the
+ * animations of the next integral part of the index (the gaps do not matter); in a click, the
+ * indexes are chained in order, and the animations of the same index play together. `slide` is
+ * the `@animation` of the slide. With `setupOnly`, only the start values are set.
+ */
+function timingXml(shapes: AnimShape[], slide: Animation, setupOnly = false): string {
+    if (!shapes.length) return ""
+    type Effect = { id: string; prop: Values; index: number; dur: number; delay: number; ease: Ease }
+    const effects: Effect[] = shapes
+        .flatMap(({ id, anim }) =>
+            animProps(anim, slide).map(({ name, from, to, dur, delay, ease }) => ({ id, index: anim.index, prop: { name, from, to }, dur, delay, ease })),
+        )
+        .sort((a, b) => a.index - b.index)
+    const values = (p: Values, v: number[]) => (p.name === "scale" ? `${v[0]},${v[1]}` : `${v[0]}`)
+    const target = (id: string, p: Values) =>
+        `smil:targetElement="${id}" smil:attributeName="${p.name === "scale" ? "transform" : p.name}"${p.name === "scale" ? ' svg:type="scale"' : ""}`
+    const animXml = (id: string, p: Values, from: number[], to: number[], dur: number, ease: Ease) =>
+        `<anim:${p.name === "scale" ? "animateTransform" : "animate"} smil:dur="${secs(dur)}" smil:fill="hold"${EASE_ATTRS[ease]} ` +
+        `${target(id, p)} smil:from="${values(p, from)}" smil:to="${values(p, to)}"/>`
+    // A transform cannot be `anim:set`: a scale is set by an instant transformation instead.
+    const setXml = (id: string, p: Values) =>
+        p.name === "opacity"
+            ? `<anim:set smil:begin="0s" smil:dur="0.001s" smil:fill="hold" ${target(id, p)} smil:to="${values(p, p.from)}"/>`
+            : animXml(id, p, p.from, p.from, 0.001, "linear")
+    const effectPar = (node: string, begin: number, preset: string, inner: string) =>
+        `<anim:par smil:begin="${secs(begin)}" smil:fill="hold" presentation:node-type="${node}" ${preset}>${inner}</anim:par>`
+
+    // Start values: those of the first animation of each property of each shape, set instantly.
+    const seen = new Set<string>()
+    const setup = new Map<AnimProp["name"], string[]>()
+    for (const e of effects) {
+        const key = `${e.id}/${e.prop.name}`
+        if (seen.has(key)) continue
+        seen.add(key)
+        const list = setup.get(e.prop.name) ?? []
+        list.push(setXml(e.id, e.prop))
+        setup.set(e.prop.name, list)
+    }
+    const setupXml = [...setup].map(([name, xs]) => effectPar("with-previous", 0, ANIM_PRESETS[name], xs.join(""))).join("")
+
+    /** The effects of a click: one block per index, each one starting when the previous one ends. */
+    const clickXml = (list: Effect[], click: boolean): string => {
+        let offset = 0
+        const out: string[] = []
+        const indexes = [...new Set(list.map(e => e.index))]
+        indexes.forEach((index, n) => {
+            const group = list.filter(e => e.index === index)
+            const pars = group.map((e, k) => {
+                const node = k > 0 ? "with-previous" : n > 0 ? "after-previous" : click ? "on-click" : "with-previous"
+                return effectPar(node, e.delay, ANIM_PRESETS[e.prop.name], animXml(e.id, e.prop, e.prop.from, e.prop.to, e.dur, e.ease))
+            })
+            out.push(`<anim:par smil:begin="${secs(offset)}">${pars.join("")}</anim:par>`)
+            offset += Math.max(...group.map(e => e.delay + e.dur))
+        })
+        return out.join("")
+    }
+
+    const floors = setupOnly ? [] : [...new Set(effects.map(e => Math.floor(e.index)))]
+    // Played as soon as the slide appears: the start values, then the animations of index 0.
+    const auto = floors[0] === 0 ? clickXml(effects.filter(e => Math.floor(e.index) === 0), false) : ""
+    const clicks = floors
+        .filter(f => f > 0)
+        .map(f => `<anim:par smil:begin="next">${clickXml(effects.filter(e => Math.floor(e.index) === f), true)}</anim:par>`)
+    return (
+        `<anim:par presentation:node-type="timing-root"><anim:seq presentation:node-type="main-sequence">` +
+        `<anim:par smil:begin="0s"><anim:par smil:begin="0s">${setupXml}</anim:par>${auto}</anim:par>` +
+        `${clicks.join("")}</anim:seq></anim:par>`
+    )
+}
+
 class Builder {
     base: string
+    /** Number of animated shapes so far, for their `draw:id`. */
+    animCount = 0
+    /** Animated shapes built for the next slide. */
+    animShapes: AnimShape[] = []
     pictures = new Map<string, Picture>()
     pages: Page[] = []
     colStyles = new Map<string, string>()
@@ -1388,6 +1946,26 @@ class Builder {
     }
 
     // -- shapes
+    /**
+     * Give each top-level shape of `xml` (a table can come with the images of its cells) an id, and
+     * keep them for the animations of the next slide, if they are animated. The text and the
+     * attributes of the shapes are escaped, so every `<` and `>` belongs to a tag.
+     */
+    animated(xml: string, anim: Anim | undefined): string {
+        if (!anim) return xml
+        let depth = 0
+        return xml.replace(/<(\/?)([\w:-]+)([^>]*?)(\/?)>/g, (tag, close: string, name: string, rest: string, empty: string) => {
+            if (close) depth--
+            else if (depth++ === 0) {
+                const id = `anim${++this.animCount}`
+                this.animShapes.push({ id, anim })
+                tag = `<${name} draw:id="${id}" xml:id="${id}"${rest}${empty}>`
+            }
+            if (empty) depth--
+            return tag
+        })
+    }
+
     static geom(x: number, y: number, w: number, h: number): string {
         return `svg:x="${f2(x)}cm" svg:y="${f2(y)}cm" svg:width="${f2(w)}cm" svg:height="${f2(h)}cm"`
     }
@@ -1412,9 +1990,9 @@ class Builder {
      * style. Lists with numbered items name the list styles `<frameStyle>-numbers` and
      * `<frameStyle>-bullets` (see `listStylesXml()`) on every nested list.
      */
-    listXml(items: ListItem[], frameStyle: string, k = 1): string {
+    listXml(items: ListItem[], frameStyle: string, k = 1, pt?: number, named = false): string {
         const holder = listStyleHolder(frameStyle)
-        const styled = holder !== null && items.some(it => it[2] !== undefined)
+        const styled = holder !== null && (named || items.some(it => it[2] !== undefined))
         const out: string[] = []
         // For each open list: is it numbered?
         const open: boolean[] = []
@@ -1435,7 +2013,7 @@ class Builder {
                 out.push(`<text:list${name}><text:list-item${start}>`)
                 open.push(ordered)
             }
-            out.push(`<text:p${this.scaledPara(sizes.list[Math.min(lvl, 8)], k, outlineStyle(frameStyle, lvl))}>${runsXml(txt)}</text:p>`)
+            out.push(`<text:p${this.scaledPara(pt ?? sizes.list[Math.min(lvl, 8)], k, outlineStyle(frameStyle, lvl))}>${runsXml(txt)}</text:p>`)
         }
         while (open.length) close()
         return out.join("")
@@ -1533,7 +2111,22 @@ class Builder {
         )
     }
 
+    /** The shapes of a block, with an id if it is animated (each part of a table on its own). */
     blockXml(b: Block, x: number, y: number, w: number, h: number): string {
+        if (b.t !== "table") return this.animated(this.shapeXml(b, x, y, w, h), animOf(b))
+        const pw = tablePartW(b, w)
+        const cols = tableBlockCols(b, w)
+        return tableParts(b)
+            .map((rows, i) =>
+                this.animated(
+                    this.tableXml(b.header, rows, x + i * (pw + TABLE_GAP), y, pw, b.pt ?? sizes.table, false, cols, (r, c) => isHidden(b, r, c)),
+                    b.anim,
+                ),
+            )
+            .join("")
+    }
+
+    shapeXml(b: Block, x: number, y: number, w: number, h: number): string {
         switch (b.t) {
             case "para":
                 return this.frame("Texte", x, y, w, h, `<text:p${this.scaledPara(sizes.text, b.k, "Texte")}>${runsXml(b.text)}</text:p>`)
@@ -1548,20 +2141,50 @@ class Builder {
             }
             case "compact":
                 return this.regionXml(b, x, y, w)
-            case "table": {
-                const pw = tablePartW(b, w)
-                const cols = tableBlockCols(b, w)
-                return tableParts(b)
-                    .map((rows, i) =>
-                        this.tableXml(b.header, rows, x + i * (pw + TABLE_GAP), y, pw, b.pt ?? sizes.table, false, cols, (r, c) => isHidden(b, r, c)),
-                    )
-                    .join("")
-            }
+            case "box":
+                return this.boxXml(b, x, y, w, h)
             case "hr":
                 return this.hrXml(x, y, w, h)
             default:
                 throw new Error(`Unexpected block ${b.t}`)
         }
+    }
+
+    /**
+     * A `@box {` region in the box `x, y, w, h`, margins included: a rectangle with rounded corners.
+     * Without nested boxes, the rectangle holds the text. Otherwise the rectangle is empty, and its
+     * paragraphs and lists (in text frames) and its boxes are stacked on it, centered vertically.
+     */
+    boxXml(b: BoxBlock, x: number, y: number, w: number, h: number): string {
+        const { padY, padX, marginY, marginX, radius } = boxGeom(b.name)
+        const name = boxStyleName(b.name)
+        const pt = boxPt(b.name)
+        const k = b.k ?? 1
+        // Lists name their list styles: shapes do not take the bullets of their style.
+        const textXml = (blocks: Block[]) =>
+            blocks
+                .map(x => (x.t === "list" ? this.listXml(x.items, name, b.k, pt, true) : x.t === "para" ? `<text:p${this.scaledPara(pt, b.k, name)}>${runsXml(x.text)}</text:p>` : ""))
+                .join("")
+        const [rx, ry, rw, rh] = [x + marginX, y + marginY, w - 2 * marginX, h - 2 * marginY]
+        const rect = (inner: string) =>
+            `<draw:rect draw:style-name="${esc(name)}" draw:corner-radius="${f2(radius)}cm" ${Builder.geom(rx, ry, rw, rh)}>${inner}</draw:rect>`
+        const items = boxItems(b)
+        if (items.every(it => it.kind === "text")) return rect(textXml(b.blocks))
+        const [cx, cw] = [rx + padX, rw - 2 * padX]
+        let cy = ry + padY + Math.max(0, (rh - 2 * padY - boxContentH(b, cw)) / 2)
+        const out = [rect("")]
+        for (const it of items) {
+            if (it.kind === "text") {
+                const th = boxTextH(b.name, it.blocks, cw, k)
+                out.push(this.frame(boxTextStyleName(b.name), cx, cy, cw, th, textXml(it.blocks)))
+                cy += th
+            } else {
+                const bh = boxH(it.box, cw)
+                out.push(this.boxXml(it.box, cx, cy, cw, bh))
+                cy += bh + BOX_GAP * k
+            }
+        }
+        return out.join("")
     }
 
     /** The columns of a `@compact {` region, top-aligned. */
@@ -1575,7 +2198,7 @@ class Builder {
                 const bh = regionBlockH(blk, arr.colW)
                 if (blk.t === "image") {
                     const [iw] = regionImageSize(blk, arr.colW)
-                    out.push(this.imageXml(blk.src, cx + (arr.colW - iw) / 2, cy, iw, bh, blk.alt))
+                    out.push(this.animated(this.imageXml(blk.src, cx + (arr.colW - iw) / 2, cy, iw, bh, blk.alt), blk.anim))
                 } else out.push(this.blockXml(blk.t === "table" && b.shown ? { ...blk, shown: b.shown } : blk, cx, cy, arr.colW, bh))
                 cy += bh + GAP * arr.k
             }
@@ -1604,10 +2227,11 @@ class Builder {
 
         if (!imgs.length) return [stack(texts, X0, W), shapes]
         const src = imgs[0].src
+        const anim = animOf(imgs[0])
         const [iw, ih] = imageSize(resolve(this.base, src))
         if (!texts.length) {
             const [w, h] = fit(iw, ih, W, H)
-            shapes.push(this.imageXml(src, X0 + (W - w) / 2, Y0 + (H - h) / 2, w, h))
+            shapes.push(this.animated(this.imageXml(src, X0 + (W - w) / 2, Y0 + (H - h) / 2, w, h), anim))
             return [0, shapes]
         }
         if (iw / ih >= 1.8 || (iw / ih >= 1.2 && sumH(W) < 2.5)) {
@@ -1615,7 +2239,7 @@ class Builder {
             const th = stack(texts, X0, W, false)
             const avail = Math.max(H - th - GAP, 4.5)
             const [w, h] = fit(iw, ih, W, avail)
-            shapes.push(this.imageXml(src, X0 + (W - w) / 2, Y0 + th + GAP + (avail - h) / 2, w, h))
+            shapes.push(this.animated(this.imageXml(src, X0 + (W - w) / 2, Y0 + th + GAP + (avail - h) / 2, w, h), anim))
             return [th + GAP + 4.5, shapes]
         }
         // Give the image more room when the text is short.
@@ -1623,7 +2247,7 @@ class Builder {
         const th = stack(texts, X0, tw)
         const bw = W - tw - 0.8
         const [w, h] = fit(iw, ih, bw, H)
-        shapes.push(this.imageXml(src, X0 + tw + 0.8 + (bw - w) / 2, Y0 + (H - h) / 2, w, h))
+        shapes.push(this.animated(this.imageXml(src, X0 + tw + 0.8 + (bw - w) / 2, Y0 + (H - h) / 2, w, h), anim))
         return [th, shapes]
     }
 
@@ -1659,10 +2283,13 @@ class Builder {
 
     /** Do these blocks fit on one slide? */
     fits(blocks: Block[]): boolean {
-        // `layout()` registers the automatic styles of the shapes it builds: forget those of this trial.
+        // `layout()` registers the automatic styles and the animated shapes it builds: forget those of this trial.
         const saved = [new Map(this.colStyles), new Map(this.rowStyles), new Map(this.paraStyles)]
+        const [animCount, animShapes] = [this.animCount, this.animShapes.length]
         const ok = this.layout(blocks)[0] <= H
         ;[this.colStyles, this.rowStyles, this.paraStyles] = saved
+        this.animCount = animCount
+        this.animShapes.length = animShapes
         return ok
     }
 
@@ -1801,8 +2428,13 @@ class Builder {
     }
 
     // -- pages
-    page(master: string, shapes: string[], notes: string[] = []): Page {
-        const page: Page = { master, shapes, notes, sec: this.current }
+    /**
+     * A slide, with the animations of the animated shapes built since the previous one. `animation` is
+     * the `@animation` of the slide (defaults of its animations); with `setupOnly`, the animated shapes
+     * only get their start values.
+     */
+    page(master: string, shapes: string[], notes: string[] = [], animation = this.current?.animation ?? {}, setupOnly = false): Page {
+        const page: Page = { master, shapes, notes, sec: this.current, timing: timingXml(this.animShapes.splice(0), animation, setupOnly) }
         this.pages.push(page)
         return page
     }
@@ -1890,10 +2522,12 @@ class Builder {
                     continue
                 }
                 const allNotes = [...pending.splice(0), ...notes]
-                for (const step of revealSteps(content)) {
+                // With `@reveal`, the animations play on the last slide, once every row is revealed.
+                const steps = revealSteps(content)
+                steps.forEach((step, i) => {
                     const [, shapes] = this.layout(step)
-                    this.page("Master", [...this.titleShapes(title, crumbs), ...shapes], [...allNotes])
-                }
+                    this.page("Master", [...this.titleShapes(title, crumbs), ...shapes], [...allNotes], undefined, i < steps.length - 1)
+                })
             }
             run = []
         }
@@ -1950,7 +2584,8 @@ class Builder {
             if (b.t === "note" || b.t === "layout") continue
             const last = items[items.length - 1]
             if (b.t === "para" || b.t === "list" || b.t === "quote") {
-                if (last?.kind === "text") last.blocks.push(b)
+                // Blocks of different `@anim` regions cannot share a text frame.
+                if (last?.kind === "text" && animOf(last.blocks[0]) === b.anim) last.blocks.push(b)
                 else items.push({ kind: "text", blocks: [b] })
             } else items.push({ kind: "block", block: b })
         }
@@ -1961,6 +2596,7 @@ class Builder {
             if (b.t === "table") return tableH(b.header, b.rows, w, sizes.tableSmall)
             if (b.t === "prompt" || b.t === "code") return promptSize(b.lines, w)[1]
             if (b.t === "hr") return HR_H
+            if (b.t === "box") return boxH(b, w)
             return 0
         })
         const flexible = items.map(it => it.kind === "text" || (it.kind === "block" && it.block.t === "image"))
@@ -1991,21 +2627,24 @@ class Builder {
                 const inner = it.blocks
                     .map(b => (b.t === "list" ? this.listXml(b.items, textStyle) : b.t === "para" || b.t === "quote" ? `<text:p>${runsXml(b.text)}</text:p>` : ""))
                     .join("")
-                shapes.push(this.frame(textStyle, x, cy, w, ih, inner))
+                shapes.push(this.animated(this.frame(textStyle, x, cy, w, ih, inner), animOf(it.blocks[0])))
             } else {
                 const b = it.block
+                const push = (xml: string) => shapes.push(this.animated(xml, animOf(b)))
                 if (b.t === "table") {
                     const header = b.header?.map(stripMd) ?? null
-                    shapes.push(this.tableXml(header, b.rows, x, cy, w, sizes.tableSmall, true))
+                    push(this.tableXml(header, b.rows, x, cy, w, sizes.tableSmall, true))
                 } else if (b.t === "image") {
                     const [iw, ihh] = imageSize(resolve(sec.source, b.src))
                     const [fw, fh] = fit(iw, ihh, w, ih)
-                    shapes.push(this.imageXml(b.src, x + (w - fw) / 2, cy + (ih - fh) / 2, fw, fh))
+                    push(this.imageXml(b.src, x + (w - fw) / 2, cy + (ih - fh) / 2, fw, fh))
                 } else if (b.t === "prompt" || b.t === "code") {
                     const [pw] = promptSize(b.lines, w)
-                    shapes.push(this.promptXml(b.lines, x + w - pw, cy, pw, ih, b.t === "prompt" ? "Prompt" : "Code"))
+                    push(this.promptXml(b.lines, x + w - pw, cy, pw, ih, b.t === "prompt" ? "Prompt" : "Code"))
                 } else if (b.t === "hr") {
-                    shapes.push(this.hrXml(x, cy, w, ih))
+                    push(this.hrXml(x, cy, w, ih))
+                } else if (b.t === "box") {
+                    push(this.boxXml(b, x, cy, w, ih))
                 }
             }
             cy += heights[i] + gap
@@ -2068,7 +2707,9 @@ class Builder {
             shapes.push(...this.cellXml(sec, x, y + hh, w, h - hh, textStyle, textPt))
             notes.push(...sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : [])))
         })
-        this.page("Master", shapes, notes)
+        // One slide for the whole group: the last `@animation` of its sections wins.
+        const animation = group.reduce((a: Animation, s) => (Object.keys(s.animation).length ? s.animation : a), this.current?.animation ?? {})
+        this.page("Master", shapes, notes, animation)
     }
 
     walk(sec: Section) {
@@ -2133,6 +2774,8 @@ const NS = [
     'xmlns:presentation="urn:oasis:names:tc:opendocument:xmlns:presentation:1.0"',
     'xmlns:svg="urn:oasis:names:tc:opendocument:xmlns:svg-compatible:1.0"',
     'xmlns:loext="urn:org:documentfoundation:names:experimental:office:xmlns:loext:1.0"',
+    'xmlns:anim="urn:oasis:names:tc:opendocument:xmlns:animation:1.0"',
+    'xmlns:smil="urn:oasis:names:tc:opendocument:xmlns:smil-compatible:1.0"',
     'office:version="1.3"',
 ].join(" ")
 
@@ -2171,7 +2814,7 @@ function styleCm(name: string, prop: string): number {
 
 /** Style of the paragraphs of level `lvl` (0-based) in a frame of style `Master-outline1`. */
 function outlineStyle(frameStyle: string, lvl: number): string {
-    return frameStyle.replace(/1$/, String(Math.min(lvl, 8) + 1))
+    return frameStyle.replace(/(-outline)1$/, `$1${Math.min(lvl, 8) + 1}`)
 }
 
 /** `name` or its nearest parent style defining both `bullets` and `numbers`, if any. */
@@ -2330,11 +2973,12 @@ function contentXml(b: Builder): string {
     if (tocBullets) auto.push(bulletsXml(tocBullets, "Toc"))
     for (const [key, name] of b.rowStyles)
         auto.push(`<style:style style:name="${name}" style:family="table-row"><style:table-row-properties style:row-height="${key}cm"/></style:style>`)
-    const pages = b.pages.map(({ master, shapes, notes }, i) => {
+    const pages = b.pages.map(({ master, shapes, notes, timing }, i) => {
         const n = i + 1
         const noteXml = notes.map(t => `<text:p>${xmlText(t)}</text:p>`).join("")
+        // The ODF schema puts the animations between the shapes and the notes.
         return (
-            `<draw:page draw:name="page${n}" draw:master-page-name="${master}">${shapes.join("")}` +
+            `<draw:page draw:name="page${n}" draw:master-page-name="${master}">${shapes.join("")}${timing ?? ""}` +
             `<presentation:notes><draw:page-thumbnail presentation:style-name="${master}-title" presentation:class="page" draw:page-number="${n}" svg:x="1.5cm" svg:y="1.5cm" svg:width="18cm" svg:height="10.13cm"/>` +
             `<draw:frame presentation:style-name="${master}-notes" presentation:class="notes" svg:x="1.5cm" svg:y="12.5cm" svg:width="18cm" svg:height="15cm"><draw:text-box>${noteXml}</draw:text-box></draw:frame>` +
             `</presentation:notes></draw:page>`
