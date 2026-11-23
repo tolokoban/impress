@@ -1,6 +1,6 @@
 {
     "name": "@tolokoban/impress",
-    "version": "0.20.0",
+    "version": "0.20.1",
     "description": "Convert teaching markdown files into LibreOffice Impress presentations (.odp)",
     "type": "module",
     "bin": {
