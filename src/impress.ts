@@ -728,7 +728,7 @@ function parse(md: string, file: string): Section {
             grouped = null
             const level = m[1].length
             while (cur.level >= level) cur = cur.parent!
-            const sec = new Section(level, stripMd(m[2]), cur, root.source)
+            const sec = new Section(level, m[2].trim(), cur, root.source)
             sec.layout = layout
             layout = null
             cur.children.push(sec)
@@ -2441,15 +2441,15 @@ class Builder {
 
     titleShapes(title: string, crumbs: string[]): string[] {
         const out: string[] = []
-        if (crumbs.length) out.push(this.frame("Fil-ariane", X0, 0.35, W, 0.6, `<text:p>${xmlText(crumbs.join(" › "))}</text:p>`))
-        out.push(this.frame("Master-title", X0, 0.95, W, 1.6, `<text:p>${xmlText(title)}</text:p>`, "title", this.takeHints()))
+        if (crumbs.length) out.push(this.frame("Fil-ariane", X0, 0.35, W, 0.6, `<text:p>${crumbs.map(runsXml).join(" › ")}</text:p>`))
+        out.push(this.frame("Master-title", X0, 0.95, W, 1.6, `<text:p>${runsXml(title)}</text:p>`, "title", this.takeHints()))
         return out
     }
 
     sectionPage(sec: Section) {
         // The big title is always the top-level (`#`) heading; the hierarchy box comes in `finish()`.
         const [title] = sec.path()
-        const shapes = [this.frame("Section-title", SEC.x, SEC.titleY, SEC.w, SEC.titleH, `<text:p>${xmlText(title)}</text:p>`, "title", this.takeHints())]
+        const shapes = [this.frame("Section-title", SEC.x, SEC.titleY, SEC.w, SEC.titleH, `<text:p>${runsXml(title)}</text:p>`, "title", this.takeHints())]
         const notes = sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : []))
         this.page("Section", shapes, notes).toc = sec
         this.lastPath = sec.path()
@@ -2484,7 +2484,7 @@ class Builder {
             const items: string[] = []
             for (const child of parent.children) {
                 if (child.continued || !child.title) continue
-                let text = xmlText(child.title)
+                let text = runsXml(child.title)
                 if (child === current) text = `<text:span text:style-name="T_section">${text}</text:span>`
                 lines.push(text)
                 const sub = ancestors.has(child) ? listXml(child) : ""
@@ -2556,7 +2556,7 @@ class Builder {
     /** Preferred width of a cell content, used by `auto` columns. */
     static preferredWidth(sec: Section, height: number, textPt: number): number {
         const cw = (pt: number) => pt * PT * 0.5
-        let w = sec.title.length * cw(sizes.gridTitle) + 0.8
+        let w = plainLen(sec.title) * cw(sizes.gridTitle) + 0.8
         for (const b of sec.blocks) {
             if (b.t === "para" || b.t === "quote") w = Math.max(w, plainLen(b.text) * cw(textPt) + 0.8)
             else if (b.t === "list") w = Math.max(w, ...b.items.map(([lvl, txt]) => plainLen(txt) * cw(textPt) + 0.9 * (lvl + 1) + 0.8))
@@ -2703,7 +2703,7 @@ class Builder {
                     : ["Colonne-titre", "Colonne-texte", sizes.columnText]
             // Cells of an `@layout` of blocks have no heading.
             const hh = sec.title ? headH : 0
-            if (sec.title) shapes.push(this.frame(headStyle, x, y, w, hh, `<text:p>${xmlText(sec.title)}</text:p>`))
+            if (sec.title) shapes.push(this.frame(headStyle, x, y, w, hh, `<text:p>${runsXml(sec.title)}</text:p>`))
             shapes.push(...this.cellXml(sec, x, y + hh, w, h - hh, textStyle, textPt))
             notes.push(...sec.blocks.flatMap(b => (b.t === "note" ? [b.text] : [])))
         })
