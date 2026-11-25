@@ -98,6 +98,7 @@ When the slide appears, the list and the image have an opacity of 0.1. The first
   - `@anim (scale=0.5:1) {` has its own list of properties: the other properties of `@animation` are not animated.
   - For each of the duration, the delay and the easing, the first one given wins: on the property in `@anim`, on the `@anim`, on the property in `@animation`, on the `@animation`. Without any, animations last 500ms, with no delay and a linear easing. An `@anim` without properties, or a property without values, that `@animation` does not complete is an error.
 - Each block in a region (paragraph, list, table, image, code…) is a shape of its own, and all of them animate together. A table carries the images of its cells along.
+- **Table cells**: a cell written `@anim [<index>] [(…)] [<timing>] { … @}` is animated on its own, with the same syntax and the same defaults as a region: `| C.R.A.F.T | @anim 1 {**C**ontexte@} | @anim 2 {**R**ôle@} |`. Impress cannot animate a single cell of a table, so the cell stays empty and its text (and its images) are drawn over it in a frame of their own, styled by `<cell style>-anim` (e.g. `Tableau-cellule-anim`: the text, alignment and padding of the cell style, without background nor borders). A cell can be animated in a table of an `@anim {` region too: it keeps its own animation.
 - A region can be inside a `@compact {` region (a list cut over several columns animates as one), but a `@compact {` region cannot be inside an `@anim {` region. Regions cannot be nested. A heading, `@next` or `@layout` inside a region, a region not closed by `@}`, an unknown property and a value out of range are errors.
 - In an `@layout`, the paragraphs and lists of a cell share a text frame, except across the border of a region.
 - With `@reveal`, the animations play on the last slide of the sequence, once every row is revealed; the slides before it show the `from` values.
@@ -121,7 +122,7 @@ The first conversion of `foo.md` writes `foo.style.json` with the complete defau
 { "theme": { "colors": { "primary": "#800020" } } }
 ```
 
-The file has seven top-level sections:
+The file has eight top-level sections:
 
 | Key | Content |
 | --- | --- |
@@ -132,6 +133,7 @@ The file has seven top-level sections:
 | `markers` | Line ends (arrows) used by diagram edges. |
 | `dashes` | Dash patterns used by diagram edges and shapes. |
 | `boxes` | The boxes of `@box <name> {`. |
+| `logo` | A logo shown on every slide (see [Logo](#logo)). |
 
 ### Theme
 
@@ -515,6 +517,22 @@ Et sa réponse : il y a bien une jurisprudence du … qui dit …
 | `graphic`, `paragraph`, `text` | Optional ODF properties, merged over those built from the values above, e.g. `"text": { "fo:font-style": "italic", "fo:font-weight": "bold" }`. |
 
 Lengths are in `cm`, `mm`, `pt` or `in`, and every value can use [placeholders](#placeholders). Each box `<name>` becomes the named drawing style `Box-<name>` (content vertically centered, text shrunk if it does not fit), so it can also be changed in LibreOffice afterwards; a style `Box-<name>` in `styles` is merged over it. A box without nested boxes is one shape holding its text. A box holding other boxes is an empty shape, with its nested boxes and its text frames (style `Box-<name>-texte`: the text of `Box-<name>` without fill, border, shadow or padding) drawn over it. Three boxes come by default: `info` (light, with an automatic text color), `warning` (orange with white text) and `terminal` (dark, monospace text of `{sizes.code}pt`, to put in another box).
+
+### Logo
+
+`logo` puts an image on every slide (content and section slides), above the background image (`theme.backgrounds`) and below everything else. The image sits in a rectangle stuck to the edges of the slide; it always keeps its aspect ratio and is centered in this rectangle, as big as possible (like CSS `object-fit: contain`).
+
+```json
+{ "logo": { "path": "images/logo.svg", "backgroundColor": "#FFFFFF", "size": { "width": 15, "height": 10 }, "margin": 2, "anchor": "BR" } }
+```
+
+| Key | Value |
+| --- | --- |
+| `path` | Path relative to the markdown file, to a SVG, PNG, JPEG or WebP image. `""` (default): no logo. |
+| `backgroundColor` | Optional color filling the whole rectangle, behind the logo, e.g. for a transparent logo on a dark section slide. Can use [placeholders](#placeholders), e.g. `{colors.white}`. |
+| `size` | Size of the rectangle, in percent (0 to 100) of the slide. A number (default `12`) is a square whose side is a percentage of the smallest side of the slide (its height). `{ "width": 15, "height": 10 }` is 15% of the slide width by 10% of its height. |
+| `margin` | Room between the rectangle and the edges of the slide, in percent (0 to 100) of the smallest side of the slide (default `0`). |
+| `anchor` | Where the rectangle is stuck to the edges of the slide: `TL`, `T`, `TR`, `BL`, `B` or `BR` (default), with T = top, B = bottom, L = left, R = right. `T` and `B` center it horizontally. |
 
 ### Recipes
 

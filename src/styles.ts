@@ -66,6 +66,27 @@ export interface BackgroundImage {
 }
 
 /**
+ * Logo drawn on every slide (both master pages), above the background image and below everything else.
+ */
+export interface LogoDef {
+    /** Path relative to the markdown file, to a SVG, PNG, JPEG or WEBP image; "" for no logo. */
+    path: string
+    /** Color filling the rectangle holding the logo (useful for transparent logos); can use theme placeholders. */
+    backgroundColor?: string
+    /**
+     * Rectangle holding the logo, in percent (0 to 100) of the slide size. A number is a square whose
+     * side is a percentage of the smallest side of the slide. `width` is in percent of the slide width
+     * and `height` in percent of the slide height. The logo keeps its aspect ratio and is centered
+     * in this rectangle, as big as possible (like CSS `object-fit: contain`).
+     */
+    size: number | { width: number; height: number }
+    /** Room between the rectangle and the edges of the slide, in percent of the smallest side of the slide (default 0). */
+    margin?: number
+    /** Corner or side where the rectangle is stuck: T=Top, B=Bottom, L=Left, R=Right. */
+    anchor: "B" | "BL" | "BR" | "T" | "TR" | "TL"
+}
+
+/**
  * Look of the boxes of `@box <name> { ... @}`. Colors and lengths can use theme placeholders.
  * Each box `<name>` becomes the named graphic style `Box-<name>`.
  */
@@ -190,6 +211,8 @@ export interface StyleConfig {
     dashes: Record<string, Props>
     /** Boxes of `@box <name> { ... @}`. */
     boxes: Record<string, BoxDef>
+    /** Logo on every slide. */
+    logo: LogoDef
 }
 
 const sans: Props = { "fo:font-family": "{fonts.sans}", "style:font-family-generic": "swiss" }
@@ -510,6 +533,8 @@ export const defaultStyle: StyleConfig = {
     dashes: {
         Tirets: { "draw:style": "rect", "draw:dots1": "1", "draw:dots1-length": "0.2cm", "draw:distance": "0.15cm" },
     },
+    /** No logo by default: set `path` to show one. */
+    logo: { path: "", size: 12, margin: 0, anchor: "BR" },
     boxes: {
         /** No `color`: black or white, whichever is more readable on the background. */
         info: {

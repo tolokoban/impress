@@ -78,7 +78,7 @@ let CENTER = false
 function useStyle(config: StyleConfig) {
     style = config
     // The boxes of `@box` become named styles (their values can use the theme, hence `style` first).
-    style = { ...config, styles: { ...config.styles, ...boxStyles(config) } }
+    style = { ...config, styles: { ...config.styles, ...boxStyles(config), ...cellAnimStyles(config) } }
     sizes = config.theme.sizes
     SLIDE_W = config.theme.slide.width
     SLIDE_H = config.theme.slide.height
@@ -238,6 +238,24 @@ function boxShadow(spec: string, where: string): Props {
  * Named styles `Box-<name>` of the boxes of the style file. A style `Box-<name>` of `styles`, if
  * any, is merged over the one built from the box.
  */
+/**
+ * `<cell style>-anim`: the text of an animated table cell (`@anim 1 {text@}`), in a frame drawn
+ * over its empty cell, because Impress cannot animate a single cell of a table. It takes the text,
+ * the alignment and the padding of the cell style, without its background and borders.
+ */
+function cellAnimStyles(config: StyleConfig): Record<string, StyleDef> {
+    const out: Record<string, StyleDef> = {}
+    const keep = ["draw:textarea-vertical-align", "fo:padding-left", "fo:padding-right", "fo:padding-top", "fo:padding-bottom"]
+    for (const [name, s] of Object.entries(config.styles)) {
+        if (s.family !== "table-cell" || config.styles[`${name}-anim`]) continue
+        const graphic: Props = { "draw:fill": "none", "draw:stroke": "none", "fo:wrap-option": "wrap" }
+        for (const k of keep) if (s.graphic?.[k] !== undefined) graphic[k] = s.graphic[k]
+        const { "fo:border": _, ...paragraph } = s.paragraph ?? {}
+        out[`${name}-anim`] = { family: "graphic", parent: "standard", graphic, paragraph, text: { ...s.text } }
+    }
+    return out
+}
+
 function boxStyles(config: StyleConfig): Record<string, StyleDef> {
     const out: Record<string, StyleDef> = {}
     for (const [name, box] of Object.entries(config.boxes ?? {})) {
@@ -867,7 +885,9 @@ function parse(md: string, file: string): Section {
             const rows: string[][] = []
             for (; i < lines.length && lines[i].trim().startsWith("|"); i++) {
                 const row = lines[i].trim().replace(/^\|/, "").replace(/\|$/, "")
-                rows.push(row.split("|").map(c => c.trim()))
+                const cells = row.split("|").map(c => c.trim())
+                for (const c of cells) cellAnim(c, `${file}:${i + 1}`)
+                rows.push(cells)
             }
             i--
             let header: string[] | null = rows[0]
@@ -1040,7 +1060,7 @@ let mdDir = "."
 
 /** Image of a table cell, sized in em (1em = the font size of the table, 16px in HTML terms). */
 type CellImage = { src: string; alt: string; w: number; h: number }
-type Cell = { text: string; imgs: CellImage[] }
+type Cell = { text: string; imgs: CellImage[]; anim?: Anim }
 
 /** `<img src="..." width="48" height="48">` or `![alt](src)`. */
 const CELL_IMG_RE = /<img\s[^>]*>|!\[([^\]]*)\]\(([^)\s]+)\)/gi
@@ -1055,6 +1075,19 @@ const CELL_PAD_X = 0.4
 
 const cellCache = new Map<string, Cell>()
 
+/** `@anim 1 (opacity=0.1:1) 300ms { **C**ontexte @}`: a table cell animated on its own. */
+const CELL_ANIM_RE = /^@anim(?:\s+(\d+(?:\.\d+)?|\.\d+)(?![\w.]))?\s*(?:\((.*)\))?\s*(.*?)\s*\{(.*)@\}$/
+
+/** The animation of a table cell, if any, and its content without the `@anim { ... @}`. */
+function cellAnim(s: string, where: string): { anim?: Anim; content: string } {
+    if (!s.startsWith("@anim")) return { content: s }
+    const m = s.match(CELL_ANIM_RE)
+    if (!m) throw new Error(`${where}: expected a table cell like "@anim [<index>] [(<property>=<from>:<to>, ...)] [<duration> [<delay>]] [<easing>] { ... @}" (e.g. "@anim 1 { **C**ontexte @}"), got "${s}"`)
+    const timing = parseTiming(m[3].split(/\s+/).filter(Boolean), where, '"@anim"')
+    const props = m[2]?.trim() ? parseAnimProps(m[2], where, false) : undefined
+    return { anim: { index: Number(m[1] ?? 0), ...(props && { props }), where, ...timing }, content: m[4].trim() }
+}
+
 function htmlAttr(tag: string, name: string): string | undefined {
     const m = tag.match(new RegExp(`\\s${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s>]+))`, "i"))
     return m ? (m[1] ?? m[2] ?? m[3]) : undefined
@@ -1064,8 +1097,9 @@ function htmlAttr(tag: string, name: string): string | undefined {
 function cell(s: string): Cell {
     let c = cellCache.get(s)
     if (c) return c
+    const { anim, content } = cellAnim(s, `table cell "${s}"`)
     const imgs: CellImage[] = []
-    const text = s
+    const text = content
         .replace(CELL_IMG_RE, (tag: string, mdAlt?: string, mdSrc?: string) => {
             const src = mdSrc ?? htmlAttr(tag, "src")
             if (!src) return tag
@@ -1087,7 +1121,7 @@ function cell(s: string): Cell {
         })
         .replace(/\s+/g, " ")
         .trim()
-    c = { text, imgs }
+    c = { text, imgs, ...(anim && { anim }) }
     cellCache.set(s, c)
     return c
 }
@@ -1885,6 +1919,8 @@ class Builder {
     colStyles = new Map<string, string>()
     rowStyles = new Map<string, string>()
     paraStyles = new Map<string, string>()
+    /** Table templates at a size other than the one of their cell styles: "<template>/<pt>" -> name. */
+    cellStyles = new Map<string, string>()
     /** Hints waiting to be attached to the next slide title. */
     pendingHints: string[] = []
     /** Heading path of the section of the last slide. */
@@ -1917,6 +1953,17 @@ class Builder {
         const key = f2(w)
         if (!this.colStyles.has(key)) this.colStyles.set(key, `co${this.colStyles.size + 1}`)
         return this.colStyles.get(key)!
+    }
+
+    /**
+     * Table template `<template>-<pt>pt`: the template `template` with its cell styles at `pt`
+     * points. A shrunk table needs it, because LibreOffice sizes the rows with the font of the cell
+     * styles of the template, not with the one of the paragraphs (see `stylesXml()`).
+     */
+    sizedTemplate(template: string, pt: number): string {
+        const key = `${template}/${f2(pt)}`
+        if (!this.cellStyles.has(key)) this.cellStyles.set(key, `${template}-${f2(pt).replace(".", "_")}pt`)
+        return this.cellStyles.get(key)!
     }
 
     /**
@@ -1956,7 +2003,8 @@ class Builder {
         let depth = 0
         return xml.replace(/<(\/?)([\w:-]+)([^>]*?)(\/?)>/g, (tag, close: string, name: string, rest: string, empty: string) => {
             if (close) depth--
-            else if (depth++ === 0) {
+            // A shape animated on its own (a cell of a table) keeps its id.
+            else if (depth++ === 0 && !/\sdraw:id="/.test(rest)) {
                 const id = `anim${++this.animCount}`
                 this.animShapes.push({ id, anim })
                 tag = `<${name} draw:id="${id}" xml:id="${id}"${rest}${empty}>`
@@ -2034,12 +2082,13 @@ class Builder {
         const prefix = small ? "Tableau-petit" : "Tableau"
         // A size other than the one of the cell styles (`@compact`) needs a paragraph style.
         const defaultPt = pt === (small ? sizes.tableSmall : sizes.table)
+        const template = defaultPt ? prefix : this.sizedTemplate(prefix, pt)
         const para = (indent: number) => (defaultPt && !indent ? "" : ` text:style-name="${this.paraStyle(pt, indent)}"`)
         // Images of the cells, drawn over the table: a table cell of Impress only holds text.
         const overlays: string[] = []
         const parts = [
             `<draw:frame draw:style-name="Tableau-cadre" ${Builder.geom(x, y, width, tableH(header, rows, width, pt, cols))}>`,
-            `<table:table table:template-name="${prefix}" table:use-first-row-styles="${header ? "true" : "false"}" table:use-banding-rows-styles="true">`,
+            `<table:table table:template-name="${template}" table:use-first-row-styles="${header ? "true" : "false"}" table:use-banding-rows-styles="true">`,
             ...cols.map(cw => `<table:table-column table:style-name="${this.colStyle(cw)}"/>`),
         ]
         const all: [string, string[]][] = [
@@ -2055,7 +2104,11 @@ class Builder {
                 // A hidden cell keeps the size of its content, so the table does not move when it shows up.
                 const c = kind !== "entete" && hidden(r, i) ? { text: "", imgs: [] } : cell(r[i] ?? "")
                 const indent = cellTextIndent(c, cw, pt)
-                parts.push(`<table:table-cell table:style-name="${prefix}-${kind}"><text:p${para(indent)}>${runsXml(c.text)}</text:p></table:table-cell>`)
+                // An animated cell is empty: its text is in a frame of its own, drawn over it.
+                const text = c.anim ? "" : runsXml(c.text)
+                parts.push(`<table:table-cell table:style-name="${template}-${kind}"><text:p${para(indent)}>${text}</text:p></table:table-cell>`)
+                const cellOverlays: string[] = []
+                if (c.anim && c.text) cellOverlays.push(this.frame(`${prefix}-${kind}-anim`, cx, cy, cw, rh, `<text:p${para(indent)}>${runsXml(c.text)}</text:p>`))
                 if (c.imgs.length) {
                     const [scale, iw] = cellImgBox(c, cw, pt)
                     const em = pt * PT * scale
@@ -2063,10 +2116,11 @@ class Builder {
                     let ix = c.text ? cx + CELL_PAD_X / 2 : cx + (cw - iw) / 2
                     for (const img of c.imgs) {
                         const [w, h] = [img.w * em, img.h * em]
-                        overlays.push(this.imageXml(img.src, ix, cy + (rh - h) / 2, w, h, img.alt))
+                        cellOverlays.push(this.imageXml(img.src, ix, cy + (rh - h) / 2, w, h, img.alt))
                         ix += w + IMG_GAP_EM * em
                     }
                 }
+                overlays.push(this.animated(cellOverlays.join(""), c.anim))
                 cx += cw
             })
             parts.push("</table:table-row>")
@@ -2284,10 +2338,10 @@ class Builder {
     /** Do these blocks fit on one slide? */
     fits(blocks: Block[]): boolean {
         // `layout()` registers the automatic styles and the animated shapes it builds: forget those of this trial.
-        const saved = [new Map(this.colStyles), new Map(this.rowStyles), new Map(this.paraStyles)]
+        const saved = [new Map(this.colStyles), new Map(this.rowStyles), new Map(this.paraStyles), new Map(this.cellStyles)]
         const [animCount, animShapes] = [this.animCount, this.animShapes.length]
         const ok = this.layout(blocks)[0] <= H
-        ;[this.colStyles, this.rowStyles, this.paraStyles] = saved
+        ;[this.colStyles, this.rowStyles, this.paraStyles, this.cellStyles] = saved
         this.animCount = animCount
         this.animShapes.length = animShapes
         return ok
@@ -2896,6 +2950,65 @@ function backgroundXml(b: Builder, master: "Master" | "Section"): string {
     )
 }
 
+/** Automatic styles of the logo (see `logoXml()`). */
+function logoStylesXml(): string {
+    const logo = style.logo
+    if (!logo?.path) return ""
+    const where = `"logo.backgroundColor"`
+    const color = logo.backgroundColor ? resolveValue(logo.backgroundColor, where) : ""
+    if (color && !rgb(color)) throw new Error(`${where} must be a color like #FFFFFF, got "${logo.backgroundColor}"`)
+    return (
+        `<style:style style:name="MLogo" style:family="graphic" style:parent-style-name="standard">` +
+        `<style:graphic-properties draw:stroke="none" draw:fill="none" draw:image-opacity="100%" draw:color-mode="standard" draw:luminance="0%" draw:contrast="0%"/></style:style>` +
+        (color
+            ? `<style:style style:name="MLogo-fond" style:family="graphic" style:parent-style-name="standard">` +
+              `<style:graphic-properties draw:stroke="none" draw:fill="solid" draw:fill-color="${esc(color)}"/></style:style>`
+            : "")
+    )
+}
+
+/** Percentage (0 to 100) of a logo value, as a fraction. Only `allowZero` accepts 0. */
+function logoPercent(value: unknown, what: string, allowZero = false): number {
+    if (typeof value !== "number" || value > 100 || value < 0 || (value === 0 && !allowZero))
+        throw new Error(`"logo.${what}" must be a number between 0 and 100, got ${JSON.stringify(value)}`)
+    return value / 100
+}
+
+/** Frame of the logo of every slide (see `StyleConfig.logo`), or "" if there is none. */
+function logoXml(b: Builder): string {
+    const logo = style.logo
+    if (!logo?.path) return ""
+    const { href, size } = b.picture(logo.path)
+    const side = Math.min(SLIDE_W, SLIDE_H)
+    // Rectangle holding the logo.
+    let boxW: number
+    let boxH: number
+    if (typeof logo.size === "number") {
+        boxW = boxH = logoPercent(logo.size, "size") * side
+    } else if (isObject(logo.size)) {
+        boxW = logoPercent(logo.size.width, "size.width") * SLIDE_W
+        boxH = logoPercent(logo.size.height, "size.height") * SLIDE_H
+    } else {
+        throw new Error(`"logo.size" must be a number or { "width": number, "height": number }`)
+    }
+    const margin = logoPercent(logo.margin ?? 0, "margin", true) * side
+    const anchor = logo.anchor
+    if (!["B", "BL", "BR", "T", "TR", "TL"].includes(anchor)) throw new Error(`"logo.anchor" must be one of B, BL, BR, T, TR, TL, got "${anchor}"`)
+    const boxY = anchor.startsWith("T") ? margin : SLIDE_H - margin - boxH
+    const boxX = anchor.endsWith("L") ? margin : anchor.endsWith("R") ? SLIDE_W - margin - boxW : (SLIDE_W - boxW) / 2
+    // The logo keeps its aspect ratio, centered in the rectangle (CSS "contain").
+    const [w, h] = fit(size[0], size[1], boxW, boxH)
+    const x = boxX + (boxW - w) / 2
+    const y = boxY + (boxH - h) / 2
+    const fond = logo.backgroundColor ? `<draw:rect draw:style-name="MLogo-fond" ${Builder.geom(boxX, boxY, boxW, boxH)}/>` : ""
+    return (
+        fond +
+        `<draw:frame draw:style-name="MLogo" ${Builder.geom(x, y, w, h)}>` +
+        `<draw:image xlink:href="${esc(href)}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>` +
+        `</draw:frame>`
+    )
+}
+
 function stylesXml(b: Builder): string {
     const templates = style.tableTemplates.map(
         t =>
@@ -2905,6 +3018,26 @@ function stylesXml(b: Builder): string {
             `<table:odd-rows table:style-name="${esc(t.bandedRows)}"/>` +
             `</table:table-template>`,
     )
+    // Templates of the shrunk tables: each one with its cell styles, at the size of the table.
+    const cellStyles: string[] = []
+    for (const [key, name] of b.cellStyles) {
+        const [base, pt] = key.split("/")
+        const t = style.tableTemplates.find(t => t.name === base)
+        if (!t) continue
+        const sized = (cellStyle: string) => {
+            cellStyles.push(
+                `<style:style style:name="${esc(`${name}-${cellStyle.slice(base.length + 1)}`)}" style:family="table-cell" style:parent-style-name="${esc(cellStyle)}"><style:text-properties fo:font-size="${pt}pt"/></style:style>`,
+            )
+            return `${name}-${cellStyle.slice(base.length + 1)}`
+        }
+        templates.push(
+            `<table:table-template table:name="${esc(name)}">` +
+                `<table:first-row table:style-name="${esc(sized(t.header))}"/>` +
+                `<table:body table:style-name="${esc(sized(t.body))}"/>` +
+                `<table:odd-rows table:style-name="${esc(sized(t.bandedRows))}"/>` +
+                `</table:table-template>`,
+        )
+    }
     const markers = [
         ...Object.entries(style.markers).map(
             ([name, m]) => `<draw:marker draw:name="${esc(name)}" svg:viewBox="${esc(m.viewBox)}" svg:d="${esc(m.d)}"/>`,
@@ -2917,6 +3050,7 @@ function stylesXml(b: Builder): string {
         `<style:style style:name="Mdp1" style:family="drawing-page"><style:drawing-page-properties draw:background-size="full" draw:fill="solid" draw:fill-color="#FFFFFF"/></style:style>`,
         backgroundStyleXml("Master"),
         backgroundStyleXml("Section"),
+        logoStylesXml(),
     ]
     const notes = (m: string) =>
         `<presentation:notes style:page-layout-name="PM2">` +
@@ -2928,6 +3062,7 @@ function stylesXml(b: Builder): string {
     const masters = [
         `<style:master-page style:name="Master" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
             backgroundXml(b, "Master") +
+            logoXml(b) +
             `<draw:rect draw:style-name="Decor" ${Builder.geom(0, 0, 0.4, SLIDE_H)}/>` +
             `<draw:line draw:style-name="Decor-ligne" svg:x1="${X0}cm" svg:y1="2.7cm" svg:x2="${X0 + W}cm" svg:y2="2.7cm"/>` +
             placeholder("Master-title", "title", X0, 0.95, W, 1.6) +
@@ -2936,6 +3071,7 @@ function stylesXml(b: Builder): string {
         `<style:master-page style:name="Section" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
             `<draw:rect draw:style-name="Section-fond" ${Builder.geom(0, 0, SLIDE_W, SLIDE_H)}/>` +
             backgroundXml(b, "Section") +
+            logoXml(b) +
             `<draw:rect draw:style-name="Decor" ${Builder.geom(0, SEC.barY, SLIDE_W, 0.12)}/>` +
             placeholder("Section-title", "title", SEC.x, SEC.titleY, SEC.w, SEC.titleH) +
             placeholder("Section-subtitle", "subtitle", SEC.x, SEC.boxY, SEC.w, SEC.boxBottom - SEC.boxY) +
@@ -2943,7 +3079,7 @@ function stylesXml(b: Builder): string {
     ]
     return (
         `<?xml version="1.0" encoding="UTF-8"?><office:document-styles ${NS}>` +
-        `<office:styles>${Object.entries(style.styles).map(([name, s]) => styleXml(name, s)).join("")}${templates.join("")}${markers.join("")}</office:styles>` +
+        `<office:styles>${Object.entries(style.styles).map(([name, s]) => styleXml(name, s)).join("")}${cellStyles.join("")}${templates.join("")}${markers.join("")}</office:styles>` +
         `<office:automatic-styles>${auto.join("")}</office:automatic-styles>` +
         `<office:master-styles>${masters.join("")}</office:master-styles></office:document-styles>`
     )
