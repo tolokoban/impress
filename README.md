@@ -133,7 +133,7 @@ The file has eight top-level sections:
 | `markers` | Line ends (arrows) used by diagram edges. |
 | `dashes` | Dash patterns used by diagram edges and shapes. |
 | `boxes` | The boxes of `@box <name> {`. |
-| `logo` | A logo shown on every slide (see [Logo](#logo)). |
+| `logo` | One or several logos shown on every slide (see [Logo](#logo)). |
 
 ### Theme
 
@@ -520,18 +520,30 @@ Lengths are in `cm`, `mm`, `pt` or `in`, and every value can use [placeholders](
 
 ### Logo
 
-`logo` puts an image on every slide (content and section slides), above the background image (`theme.backgrounds`) and below everything else. The image sits in a rectangle stuck to the edges of the slide; it always keeps its aspect ratio and is centered in this rectangle, as big as possible (like CSS `object-fit: contain`).
+`logo` puts an image on every slide (content and section slides), above the background image (`theme.backgrounds`) and the vertical bar of the content slides, below everything else. The image sits in a rectangle stuck to the edges of the slide; it always keeps its aspect ratio and is as big as possible in this rectangle (like CSS `object-fit: contain`), pushed toward the anchor: with `BR`, a wide logo touches the bottom of the rectangle and a tall one touches its right side; with `B` or `T`, it is centered horizontally.
+
+`logo` is one logo, or an array of logos. Each logo of an array is completed with the default values (`size` 12, `margin` 0, `anchor` `BR`). Logos with the same `anchor` are stacked vertically, in the order of the array, starting from the edge of the anchor (the first one of `BR` is at the bottom, the first one of `TR` at the top). They are stacked by the actual height of each logo, not the height of its rectangle, so wide logos in square rectangles do not leave gaps; between two stacked logos, the room is the largest of their facing margins (as with CSS margin collapsing: the `top` margin of the lower logo and the `bottom` margin of the upper one).
 
 ```json
 { "logo": { "path": "images/logo.svg", "backgroundColor": "#FFFFFF", "size": { "width": 15, "height": 10 }, "margin": 2, "anchor": "BR" } }
 ```
 
+```json
+{
+    "logo": [
+        { "path": "images/school.png", "anchor": "TR", "margin": 1 },
+        { "path": "images/partner.svg", "anchor": "TR", "margin": 1, "size": 8 },
+        { "path": "images/license.svg", "anchor": "BL", "size": { "width": 10, "height": 5 } }
+    ]
+}
+```
+
 | Key | Value |
 | --- | --- |
 | `path` | Path relative to the markdown file, to a SVG, PNG, JPEG or WebP image. `""` (default): no logo. |
-| `backgroundColor` | Optional color filling the whole rectangle, behind the logo, e.g. for a transparent logo on a dark section slide. Can use [placeholders](#placeholders), e.g. `{colors.white}`. |
+| `backgroundColor` | Optional color behind the logo, with the width of the rectangle and the height of the logo, e.g. for a transparent logo on a dark section slide. Can use [placeholders](#placeholders), e.g. `{colors.white}`. |
 | `size` | Size of the rectangle, in percent (0 to 100) of the slide. A number (default `12`) is a square whose side is a percentage of the smallest side of the slide (its height). `{ "width": 15, "height": 10 }` is 15% of the slide width by 10% of its height. |
-| `margin` | Room between the rectangle and the edges of the slide, in percent (0 to 100) of the smallest side of the slide (default `0`). |
+| `margin` | Room around the logo, in percent (0 to 100) of the smallest side of the slide (default `0`). As in CSS: `2` for every side, `[1, 3]` for `[vertical, horizontal]`, or `[1, 3, 0, 2]` for `[top, right, bottom, left]`. A logo anchored `B` or `T` is centered between its `left` and `right` margins. |
 | `anchor` | Where the rectangle is stuck to the edges of the slide: `TL`, `T`, `TR`, `BL`, `B` or `BR` (default), with T = top, B = bottom, L = left, R = right. `T` and `B` center it horizontally. |
 
 ### Recipes

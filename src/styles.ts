@@ -76,12 +76,16 @@ export interface LogoDef {
     /**
      * Rectangle holding the logo, in percent (0 to 100) of the slide size. A number is a square whose
      * side is a percentage of the smallest side of the slide. `width` is in percent of the slide width
-     * and `height` in percent of the slide height. The logo keeps its aspect ratio and is centered
-     * in this rectangle, as big as possible (like CSS `object-fit: contain`).
+     * and `height` in percent of the slide height. The logo keeps its aspect ratio and is as big as
+     * possible in this rectangle (like CSS `object-fit: contain`), pushed toward the anchor.
      */
     size: number | { width: number; height: number }
-    /** Room between the rectangle and the edges of the slide, in percent of the smallest side of the slide (default 0). */
-    margin?: number
+    /**
+     * Room around the logo, in percent of the smallest side of the slide (default 0), as in CSS:
+     * `m` for every side, `[vertical, horizontal]`, or `[top, right, bottom, left]`.
+     * Between two stacked logos, the room is the largest of their facing margins (like CSS margin collapsing).
+     */
+    margin?: number | [number, number] | [number, number, number, number]
     /** Corner or side where the rectangle is stuck: T=Top, B=Bottom, L=Left, R=Right. */
     anchor: "B" | "BL" | "BR" | "T" | "TR" | "TL"
 }
@@ -211,8 +215,8 @@ export interface StyleConfig {
     dashes: Record<string, Props>
     /** Boxes of `@box <name> { ... @}`. */
     boxes: Record<string, BoxDef>
-    /** Logo on every slide. */
-    logo: LogoDef
+    /** Logo(s) on every slide. Logos with the same anchor are stacked vertically. */
+    logo: LogoDef | LogoDef[]
 }
 
 const sans: Props = { "fo:font-family": "{fonts.sans}", "style:font-family-generic": "swiss" }
@@ -518,6 +522,12 @@ const defaultStyles: Record<string, StyleDef> = {
     ...tableStyles("Tableau-petit", "{sizes.tableSmall}pt"),
 }
 
+/**
+ * No logo by default: set `path` to show one. Each logo of an array of logos
+ * is completed with these values.
+ */
+export const defaultLogo: LogoDef = { path: "", size: 12, margin: 0, anchor: "BR" }
+
 export const defaultStyle: StyleConfig = {
     theme: defaultTheme,
     styles: defaultStyles,
@@ -533,8 +543,7 @@ export const defaultStyle: StyleConfig = {
     dashes: {
         Tirets: { "draw:style": "rect", "draw:dots1": "1", "draw:dots1-length": "0.2cm", "draw:distance": "0.15cm" },
     },
-    /** No logo by default: set `path` to show one. */
-    logo: { path: "", size: 12, margin: 0, anchor: "BR" },
+    logo: defaultLogo,
     boxes: {
         /** No `color`: black or white, whichever is more readable on the background. */
         info: {

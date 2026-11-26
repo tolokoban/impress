@@ -47,7 +47,7 @@ import { createInterface } from "node:readline/promises"
 
 import sharp from "sharp"
 
-import { defaultStyle, type BackgroundImage, type BulletDef, type NumberDef, type Props, type StyleConfig, type StyleDef } from "./styles.ts"
+import { defaultLogo, defaultStyle, type BackgroundImage, type LogoDef, type BulletDef, type NumberDef, type Props, type StyleConfig, type StyleDef } from "./styles.ts"
 
 const PT = 0.03528 // cm per point
 
@@ -2950,63 +2950,117 @@ function backgroundXml(b: Builder, master: "Master" | "Section"): string {
     )
 }
 
-/** Automatic styles of the logo (see `logoXml()`). */
+/**
+ * The logos of `style.logo` (one object or an array), each one completed with the defaults.
+ * Those whose `path` is empty are not drawn.
+ */
+function logos(): LogoDef[] {
+    const list = Array.isArray(style.logo) ? style.logo : [style.logo]
+    return list.map(logo => ({ ...defaultLogo, ...logo }))
+}
+
+/** Automatic styles of the logos (see `logoXml()`): one for the images, one per background color. */
 function logoStylesXml(): string {
-    const logo = style.logo
-    if (!logo?.path) return ""
-    const where = `"logo.backgroundColor"`
-    const color = logo.backgroundColor ? resolveValue(logo.backgroundColor, where) : ""
-    if (color && !rgb(color)) throw new Error(`${where} must be a color like #FFFFFF, got "${logo.backgroundColor}"`)
+    const all = logos()
+    if (!all.some(logo => logo.path)) return ""
+    const fills = all.map((logo, i) => {
+        if (!logo.path || !logo.backgroundColor) return ""
+        const where = `"logo[${i}].backgroundColor"`
+        const color = resolveValue(logo.backgroundColor, where)
+        if (!rgb(color)) throw new Error(`${where} must be a color like #FFFFFF, got "${logo.backgroundColor}"`)
+        return (
+            `<style:style style:name="MLogo-fond-${i}" style:family="graphic" style:parent-style-name="standard">` +
+            `<style:graphic-properties draw:stroke="none" draw:fill="solid" draw:fill-color="${esc(color)}"/></style:style>`
+        )
+    })
     return (
         `<style:style style:name="MLogo" style:family="graphic" style:parent-style-name="standard">` +
         `<style:graphic-properties draw:stroke="none" draw:fill="none" draw:image-opacity="100%" draw:color-mode="standard" draw:luminance="0%" draw:contrast="0%"/></style:style>` +
-        (color
-            ? `<style:style style:name="MLogo-fond" style:family="graphic" style:parent-style-name="standard">` +
-              `<style:graphic-properties draw:stroke="none" draw:fill="solid" draw:fill-color="${esc(color)}"/></style:style>`
-            : "")
+        fills.join("")
     )
 }
 
 /** Percentage (0 to 100) of a logo value, as a fraction. Only `allowZero` accepts 0. */
 function logoPercent(value: unknown, what: string, allowZero = false): number {
     if (typeof value !== "number" || value > 100 || value < 0 || (value === 0 && !allowZero))
-        throw new Error(`"logo.${what}" must be a number between 0 and 100, got ${JSON.stringify(value)}`)
+        throw new Error(`"${what}" must be a number between 0 and 100, got ${JSON.stringify(value)}`)
     return value / 100
 }
 
-/** Frame of the logo of every slide (see `StyleConfig.logo`), or "" if there is none. */
-function logoXml(b: Builder): string {
-    const logo = style.logo
-    if (!logo?.path) return ""
-    const { href, size } = b.picture(logo.path)
-    const side = Math.min(SLIDE_W, SLIDE_H)
-    // Rectangle holding the logo.
-    let boxW: number
-    let boxH: number
-    if (typeof logo.size === "number") {
-        boxW = boxH = logoPercent(logo.size, "size") * side
-    } else if (isObject(logo.size)) {
-        boxW = logoPercent(logo.size.width, "size.width") * SLIDE_W
-        boxH = logoPercent(logo.size.height, "size.height") * SLIDE_H
-    } else {
-        throw new Error(`"logo.size" must be a number or { "width": number, "height": number }`)
+/**
+ * Margins of a logo as fractions of the smallest side of the slide: [top, right, bottom, left].
+ * As in CSS: `m` for every side, `[vertical, horizontal]` or `[top, right, bottom, left]`.
+ */
+function logoMargins(margin: unknown, where: string): [number, number, number, number] {
+    if (typeof margin === "number") {
+        const m = logoPercent(margin, where, true)
+        return [m, m, m, m]
     }
-    const margin = logoPercent(logo.margin ?? 0, "margin", true) * side
-    const anchor = logo.anchor
-    if (!["B", "BL", "BR", "T", "TR", "TL"].includes(anchor)) throw new Error(`"logo.anchor" must be one of B, BL, BR, T, TR, TL, got "${anchor}"`)
-    const boxY = anchor.startsWith("T") ? margin : SLIDE_H - margin - boxH
-    const boxX = anchor.endsWith("L") ? margin : anchor.endsWith("R") ? SLIDE_W - margin - boxW : (SLIDE_W - boxW) / 2
-    // The logo keeps its aspect ratio, centered in the rectangle (CSS "contain").
-    const [w, h] = fit(size[0], size[1], boxW, boxH)
-    const x = boxX + (boxW - w) / 2
-    const y = boxY + (boxH - h) / 2
-    const fond = logo.backgroundColor ? `<draw:rect draw:style-name="MLogo-fond" ${Builder.geom(boxX, boxY, boxW, boxH)}/>` : ""
-    return (
-        fond +
-        `<draw:frame draw:style-name="MLogo" ${Builder.geom(x, y, w, h)}>` +
-        `<draw:image xlink:href="${esc(href)}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>` +
-        `</draw:frame>`
-    )
+    if (Array.isArray(margin) && (margin.length === 2 || margin.length === 4)) {
+        const [top, right, bottom = top, left = right] = margin.map((m, k) => logoPercent(m, `${where}[${k}]`, true))
+        return [top, right, bottom, left]
+    }
+    throw new Error(`"${where}" must be a number, [vertical, horizontal] or [top, right, bottom, left], got ${JSON.stringify(margin)}`)
+}
+
+/**
+ * Frames of the logos of every slide (see `StyleConfig.logo`), or "" if there is none.
+ * Logos with the same anchor are stacked vertically, in their order, starting from the edge
+ * of the anchor, by their actual height (not the height of their rectangle). Between two stacked
+ * logos, the room is the largest of their facing margins (like CSS margin collapsing).
+ */
+function logoXml(b: Builder): string {
+    const side = Math.min(SLIDE_W, SLIDE_H)
+    /**
+     * For each anchor, distance from its top or bottom edge already taken by the logos (`edge`),
+     * and the margin of the last logo on the side away from that edge (`far`).
+     */
+    const stacks = new Map<string, { edge: number; far: number }>()
+    return logos()
+        .map((logo, i) => {
+            if (!logo.path) return ""
+            const where = `logo[${i}]`
+            const { href, size } = b.picture(logo.path)
+            // Rectangle holding the logo.
+            let boxW: number
+            let boxH: number
+            if (typeof logo.size === "number") {
+                boxW = boxH = logoPercent(logo.size, `${where}.size`) * side
+            } else if (isObject(logo.size)) {
+                boxW = logoPercent(logo.size.width, `${where}.size.width`) * SLIDE_W
+                boxH = logoPercent(logo.size.height, `${where}.size.height`) * SLIDE_H
+            } else {
+                throw new Error(`"${where}.size" must be a number or { "width": number, "height": number }`)
+            }
+            const [top, right, bottom, left] = logoMargins(logo.margin ?? 0, `${where}.margin`).map(m => m * side)
+            const anchor = logo.anchor
+            if (!["B", "BL", "BR", "T", "TR", "TL"].includes(anchor))
+                throw new Error(`"${where}.anchor" must be one of B, BL, BR, T, TR, TL, got "${anchor}"`)
+            // The logo keeps its aspect ratio (CSS "contain") and is pushed toward its anchor in the rectangle.
+            const [w, h] = fit(size[0], size[1], boxW, boxH)
+            // Stacked by the actual height of the logo, not by the height of its rectangle.
+            const fromTop = anchor.startsWith("T")
+            const [near, far] = fromTop ? [top, bottom] : [bottom, top]
+            const stack = stacks.get(anchor) ?? { edge: 0, far: 0 }
+            const offset = stack.edge + Math.max(stack.far, near)
+            stacks.set(anchor, { edge: offset + h, far })
+            const y = fromTop ? offset : SLIDE_H - offset - h
+            const boxX = anchor.endsWith("L")
+                ? left
+                : anchor.endsWith("R")
+                  ? SLIDE_W - right - boxW
+                  : left + (SLIDE_W - left - right - boxW) / 2
+            const x = anchor.endsWith("L") ? boxX : anchor.endsWith("R") ? boxX + boxW - w : boxX + (boxW - w) / 2
+            // The background has the width of the rectangle and the height of the logo, so stacked backgrounds do not overlap.
+            const fond = logo.backgroundColor ? `<draw:rect draw:style-name="MLogo-fond-${i}" ${Builder.geom(boxX, y, boxW, h)}/>` : ""
+            return (
+                fond +
+                `<draw:frame draw:style-name="MLogo" ${Builder.geom(x, y, w, h)}>` +
+                `<draw:image xlink:href="${esc(href)}" xlink:type="simple" xlink:show="embed" xlink:actuate="onLoad"/>` +
+                `</draw:frame>`
+            )
+        })
+        .join("")
 }
 
 function stylesXml(b: Builder): string {
@@ -3062,8 +3116,9 @@ function stylesXml(b: Builder): string {
     const masters = [
         `<style:master-page style:name="Master" style:page-layout-name="PM1" draw:style-name="Mdp1">` +
             backgroundXml(b, "Master") +
-            logoXml(b) +
             `<draw:rect draw:style-name="Decor" ${Builder.geom(0, 0, 0.4, SLIDE_H)}/>` +
+            // Above the vertical bar, so that a logo anchored on the left is not hidden by it.
+            logoXml(b) +
             `<draw:line draw:style-name="Decor-ligne" svg:x1="${X0}cm" svg:y1="2.7cm" svg:x2="${X0 + W}cm" svg:y2="2.7cm"/>` +
             placeholder("Master-title", "title", X0, 0.95, W, 1.6) +
             placeholder("Master-outline1", "outline", X0, Y0, W, H) +
